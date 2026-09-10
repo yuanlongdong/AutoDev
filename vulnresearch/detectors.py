@@ -143,6 +143,86 @@ def _is_variable(arg: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# v0.5.0 – FastAPI / Starlette support helpers
+# ---------------------------------------------------------------------------
+#
+# FastAPI handlers take user input through *function parameters* (query / path /
+# header / body models) rather than through ``request.args`` / ``request.form``
+# attribute accesses inside the body.  The legacy ``fn.sources`` signal only
+# fires on ``request.*`` calls, so a FastAPI route handler otherwise looks like
+# it has no tainted input.  These helpers bridge that gap without executing any
+# target code.
+
+# Decorator that marks a function as a web route (Flask/FastAPI/Django).
+_ROUTE_DECO_RE = re.compile(
+    r"@?\w+\s*\.\s*(?:get|post|put|delete|patch|options|head)\s*\(|\.route\b",
+    re.I,
+)
+# RHS expressions that are attacker-controlled (tainted origins).
+_REQUEST_SRC_RE = re.compile(
+    r"request\.(?:args|form|json|values|data|body|cookies|headers|"
+    r"query_params|view_args|files|POST|GET)\b"
+    r"|request\s*\[\s*['\"]",
+    re.I,
+)
+_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][\w\.]*)\s*=\s*(.+)$")
+# Calls that neutralise a tainted path/filename (basename strips directory
+# components; secure_filename is the canonical Flask upload sanitiser).
+_SANITIZER_CALL_RE = re.compile(r"\b(?:basename|secure_filename)\s*\(")
+
+
+def is_route_handler(fn: FunctionIR) -> bool:
+    """True when *fn* is registered as an HTTP route handler.
+
+    Recognises both ``@app.route(...)`` (Flask) and ``@app.get(...)`` /
+    ``@router.post(...)`` / ``@bp.put(...)`` (FastAPI / Starlette / Django).
+    """
+    decos = list(getattr(fn, "decorators", []) or [])
+    return any(_ROUTE_DECO_RE.search(d) for d in decos)
+
+
+def route_handler_taints_params(fn: FunctionIR) -> bool:
+    """FastAPI route handler: every non-dependency parameter is caller input."""
+    return is_route_handler(fn)
+
+
+def taint_names(fn: FunctionIR) -> set:
+    """Lightweight intra-procedural taint set.
+
+    Starts from route-handler parameters (FastAPI query/path/header inputs) and
+    from locals assigned directly from ``request.*`` expressions, then
+    propagates forward through simple ``name = <expr>`` assignments until a
+    fixed point.  A variable that is reassigned through a recognised sanitiser
+    (``os.path.basename`` / ``secure_filename``) is de-tainted.  Only used to
+    *add* detections (never to suppress existing ones) so legacy Flask /
+    Django behaviour is preserved.
+    """
+    tainted: set = set(fn.parameters) if is_route_handler(fn) else set()
+    for expr in fn.assignment_exprs:
+        m = _ASSIGN_RE.match(expr.strip())
+        if m and _REQUEST_SRC_RE.search(m.group(2)):
+            tainted.add(m.group(1).split(".")[0])
+    changed = True
+    while changed:
+        changed = False
+        for expr in fn.assignment_exprs:
+            m = _ASSIGN_RE.match(expr.strip())
+            if not m:
+                continue
+            lhs = m.group(1).split(".")[0]
+            rhs = m.group(2)
+            refs_tainted = any(t and t in rhs for t in tainted)
+            sanitized = bool(_SANITIZER_CALL_RE.search(rhs))
+            if refs_tainted and sanitized and lhs in tainted:
+                tainted.discard(lhs)
+                changed = True
+            elif refs_tainted and not sanitized and lhs not in tainted:
+                tainted.add(lhs)
+                changed = True
+    return tainted
+
+
+# ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
 
@@ -363,14 +443,23 @@ class CommandInjectionDetector(StructuredDetector):
 # ---------------------------------------------------------------------------
 
 class PathTraversalDetector(StructuredDetector):
-    """Detect open() / read with caller-controlled paths."""
+    """Detect open() / read / FileResponse with caller-controlled paths.
+
+    v0.5.0: sinks include FastAPI's ``FileResponse`` and route-handler
+    parameters (e.g. ``def get(name: str)``) are recognised as tainted input,
+    with light forward propagation through ``path = os.path.join(...)``.
+    """
 
     category = "path-traversal"
-    _OPEN_CALLS = {"open", "read_text", "read_bytes", "send_file", "send_from_directory"}
+    _OPEN_CALLS = {
+        "open", "read_text", "read_bytes", "send_file", "send_from_directory",
+        "FileResponse",
+    }
 
     def detect(self, fn, source_lines, project_ir):
         out = []
-        has_source = bool(fn.sources)
+        tainted = taint_names(fn)
+        has_source = bool(fn.sources) or bool(tainted)
         for call in fn.calls:
             base = call.name.split(".")[-1]
             if base not in self._OPEN_CALLS:
@@ -378,14 +467,25 @@ class PathTraversalDetector(StructuredDetector):
             if not call.args:
                 continue
             first = call.args[0]
-            if has_source and _is_variable(first) and not _is_string_literal(first):
-                out.append(_build_vuln(
-                    self.category, fn.path, call.line,
-                    first.strip(), "filesystem",
-                    f"Filesystem access on a caller-controlled path in '{fn.name}'",
-                    "Resolve the path and constrain it to an allowlisted base directory.",
-                    fn.name,
-                ))
+            if not has_source:
+                continue
+            if not (_is_variable(first) and not _is_string_literal(first)):
+                continue
+            # Legacy Flask/Django gate: any request.* call in the function keeps
+            # the existing behaviour (report any variable path argument).
+            # New FastAPI gate: only report when the path expression itself is
+            # tainted (route param or propagated from one).
+            if not fn.sources:
+                root = first.strip().split("[")[0].split("(")[0].split(".")[0]
+                if root not in tainted:
+                    continue
+            out.append(_build_vuln(
+                self.category, fn.path, call.line,
+                first.strip(), "filesystem",
+                f"Filesystem access on a caller-controlled path in '{fn.name}'",
+                "Resolve the path and constrain it to an allowlisted base directory.",
+                fn.name,
+            ))
         return out
 
 
@@ -837,6 +937,34 @@ class HardcodedSecretDetector(StructuredDetector):
     )
     # AWS Access Key ID canonical format (prefix + 20 uppercase alnum / digits).
     _AKIA_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
+    # v0.5.0: ``SECRET = os.environ.get("KEY", "hardcoded-default")`` — the
+    # second argument is a fallback secret that ships in source.
+    _ENV_DEFAULT_RE = re.compile(
+        r"(?i)\b([A-Za-z_][A-Za-z0-9_]*(?:secret|key|password|passwd|token|credential)"
+        r"[A-Za-z0-9_]*)"
+        r"\s*=\s*os\.environ\.get\s*\(\s*['\"][^'\"]*['\"]\s*,\s*"
+        r"(?P<quote>['\"])(?P<val>(?:(?!(?P=quote)).){6,})(?P=quote)\s*\)"
+    )
+    _SECRET_PREFIXES = (
+        "sk_test_", "sk_live_", "pk_test_", "pk_live_", "AKIA",
+        "gh_", "github_pat_", "whsec_", "eyJ",
+    )
+
+    def _looks_like_secret(self, value: str) -> bool:
+        """Conservative heuristic: only flag defaults that look like real secrets."""
+        v = value.strip()
+        if len(v) < 8:
+            return False
+        if v.lower().startswith(self._SECRET_PREFIXES):
+            return True
+        # mixed alnum + punctuation is characteristic of a generated secret
+        has_letter = bool(re.search(r"[A-Za-z]", v))
+        has_digit = bool(re.search(r"[0-9]", v))
+        has_punct = bool(re.search(r"[^A-Za-z0-9]", v))
+        if has_letter and has_digit and has_punct:
+            return True
+        # long random-looking blob
+        return len(v) >= 16 and has_letter and has_digit
 
     def detect(self, fn, source_lines, project_ir):
         out = []
@@ -848,6 +976,19 @@ class HardcodedSecretDetector(StructuredDetector):
                     line.strip(), "configuration",
                     f"Hardcoded secret literal detected: {m.group(0)[:60]}",
                     "Move secrets to environment variables or a dedicated secret manager.",
+                    fn.name,
+                ))
+                continue
+            # v0.5.0: hardcoded default inside os.environ.get(...)
+            m = self._ENV_DEFAULT_RE.search(line)
+            if m and self._looks_like_secret(m.group("val")):
+                out.append(_build_vuln(
+                    self.category, fn.path, idx,
+                    line.strip(), "configuration",
+                    f"Hardcoded fallback secret in os.environ.get default for "
+                    f"'{m.group(1).strip()}'",
+                    "Move secrets to environment variables or a dedicated secret manager "
+                    "(never ship a usable default).",
                     fn.name,
                 ))
                 continue
@@ -1089,13 +1230,20 @@ class FileUploadDetector(StructuredDetector):
 # ---------------------------------------------------------------------------
 
 class OpenRedirectDetector(StructuredDetector):
-    """Detect redirect() to a caller-controlled URL."""
+    """Detect redirect() / RedirectResponse() to a caller-controlled URL.
+
+    v0.5.0: adds FastAPI / Starlette ``RedirectResponse(url=...)`` and treats a
+    route-handler parameter (e.g. ``def go(next: str)``) as tainted input.
+    """
 
     category = "open-redirect"
-    _CALLS = {"redirect", "HttpResponseRedirect"}
+    _CALLS = {"redirect", "HttpResponseRedirect", "RedirectResponse"}
+    _URL_KWARG = re.compile(r"^url\s*=\s*(.+)$", re.S)
 
     def detect(self, fn, source_lines, project_ir):
         out = []
+        route_handler = is_route_handler(fn)
+        tainted_params = set(fn.parameters) if route_handler else set()
         for call in fn.calls:
             base = call.name.split(".")[-1]
             if base not in self._CALLS:
@@ -1103,7 +1251,16 @@ class OpenRedirectDetector(StructuredDetector):
             if not call.args:
                 continue
             first = call.args[0]
-            if fn.sources and _is_variable(first) and not _is_string_literal(first):
+            # ``RedirectResponse(url=next)`` — unwrap the keyword form.
+            m = self._URL_KWARG.match(first.strip())
+            if m:
+                first = m.group(1).strip()
+            if not _is_variable(first) or _is_string_literal(first):
+                continue
+            root = first.split("[")[0].split(".")[0]
+            # Flask-style: some request.* call exists in the handler.
+            # FastAPI-style: the redirect target is a route-handler parameter.
+            if fn.sources or (route_handler and root in tainted_params):
                 out.append(_build_vuln(
                     self.category, fn.path, call.line,
                     first.strip(), "browser",
@@ -1182,10 +1339,31 @@ class InsecureDefaultDetector(StructuredDetector):
 # ---------------------------------------------------------------------------
 
 class AuthBypassDetector(StructuredDetector):
-    """Flag admin routes that lack an authentication decorator."""
+    """Flag admin routes that lack an authentication mechanism.
+
+    v0.5.0: recognises FastAPI admin routes such as
+    ``@app.get("/api/admin/users")`` and treats a ``Depends(...)`` dependency in
+    the handler signature as authentication.  A route whose path contains an
+    ``admin`` segment and that has neither an auth decorator nor any
+    ``Depends(...)`` is reported.
+    """
 
     category = "auth-bypass"
-    _ADMIN_RE = re.compile(r"['\"]/admin", re.IGNORECASE)
+    _ADMIN_RE = re.compile(r"/admin(?:[/\"']|$)", re.IGNORECASE)
+    _DEPENDS_RE = re.compile(r"\bDepends\s*\(")
+
+    @staticmethod
+    def _signature_text(fn, source_lines) -> str:
+        """The def(...) signature line(s), up to and including the closing ':'."""
+        lines = []
+        i = fn.line - 1
+        n = min(len(source_lines), fn.end_line)
+        while i < n:
+            lines.append(source_lines[i])
+            if source_lines[i].rstrip().endswith(":"):
+                break
+            i += 1
+        return " ".join(l.strip() for l in lines)
 
     def detect(self, fn, source_lines, project_ir):
         decos = self.decorators(fn, source_lines)
@@ -1198,14 +1376,17 @@ class AuthBypassDetector(StructuredDetector):
             d.split("(")[0].strip() in AUTH_PATTERNS["authentication_decorators"]
             for d in decos
         )
+        # FastAPI: ``user=Depends(current_user)`` in the signature is an auth dependency.
+        if self._DEPENDS_RE.search(self._signature_text(fn, source_lines)):
+            has_auth = True
         if has_auth:
             return []
         out = []
         out.append(_build_vuln(
             self.category, fn.path, fn.line,
             decos[0], "authentication",
-            f"Admin route '{fn.name}' registered without any authentication decorator",
-            "Protect admin routes with @login_required / @jwt_required or equivalent.",
+            f"Admin route '{fn.name}' registered without any authentication dependency",
+            "Protect admin routes with @login_required / Depends(current_user) or equivalent.",
             fn.name,
         ))
         return out
@@ -1258,6 +1439,38 @@ class IDORDetector(StructuredDetector):
         "assert_owner", "require_admin",
     )
     _DESTRUCTIVE = re.compile(r"\b(?:delete|remove|drop)\s*\(", re.I)
+    # v0.5.0: a body comparison that ties the fetched row's owner to the
+    # authenticated principal (``row["owner_id"] != user["id"]``) is an
+    # authorisation check even when it does not name a recognised token.
+    _OWNERSHIP_RE = re.compile(
+        r"(owner_id|user_id|created_by|account_id|owner)\b.{0,18}(?:!=|==).{0,18}"
+        r"(user|current_user|session)\b"
+        r"|\b(user|current_user)\b.{0,18}(?:!=|==).{0,18}"
+        r"(owner_id|user_id|created_by|row|doc|note|item|record)\b",
+        re.I,
+    )
+
+    @staticmethod
+    def _body_after_signature(fn, source_lines) -> str:
+        """Source lines strictly after the ``def ... :`` signature.
+
+        FastAPI authentication is expressed as ``user=Depends(current_user)`` in
+        the *signature*; that proves authentication, **not** authorisation.  The
+        body is where an ownership / role comparison (``row["owner_id"] ==
+        user["id"]``) would live.  Separating the two lets us stop treating a
+        signature-only ``current_user`` as sufficient authorization.
+        """
+        start = fn.line - 1
+        i = start
+        n = min(len(source_lines), fn.end_line)
+        while i < n and not source_lines[i].rstrip().endswith(":"):
+            i += 1
+        i += 1  # skip the closing ':' line itself
+        return "\n".join(
+            source_lines[k]
+            for k in range(i, n)
+            if not source_lines[k].strip().startswith("#")
+        )
 
     def detect(self, fn, source_lines, project_ir):
         # 1. route decorator required
@@ -1298,9 +1511,14 @@ class IDORDetector(StructuredDetector):
                 break
         if not used_in_lookup and not non_orm_access:
             return []
-        # 4. authorization check present → skip (false-positive guard)
-        authz_text = self.code_text(fn, source_lines) + "\n" + "\n".join(decos)
+        # 4. authorization check present → skip (false-positive guard).
+        # v0.5.0: check only the *body* plus decorators.  A FastAPI
+        # ``user=Depends(current_user)`` in the signature is authentication,
+        # not authorisation, and must not suppress an IDOR finding.
+        authz_text = self._body_after_signature(fn, source_lines) + "\n" + "\n".join(decos)
         if any(tok in authz_text for tok in self._AUTHZ_TOKENS):
+            return []
+        if self._OWNERSHIP_RE.search(authz_text):
             return []
         # destructive operation → privilege escalation.  v0.4.0 also treats a
         # ``value != id`` rebuild (list comprehension removal) and a function
@@ -1341,36 +1559,78 @@ class IDORDetector(StructuredDetector):
 # ---------------------------------------------------------------------------
 
 class NoSQLInjectionDetector(StructuredDetector):
-    """Detect MongoDB queries built from caller-controlled dicts."""
+    """Detect MongoDB queries built from caller-controlled dicts.
+
+    v0.5.0: also flags a FastAPI route handler that forwards
+    ``await request.json()`` (or a route parameter) into a helper which the
+    project IR shows ultimately issues a ``find`` / ``find_one`` / ``insert``
+    against the driver.  Cross-function tracking is deliberately shallow — it
+    only follows one hop — but it catches the common
+    ``return get_users(query)`` indirection.
+    """
 
     category = "nosql-injection"
     _MONGO_CALLS = {"find_one", "find", "insert_one", "insert_many",
                     "update_one", "update_many", "delete_one", "delete_many"}
     _OPERATOR_RE = re.compile(r"\$(?:where|gt|lt|ne|regex|expr|func)")
 
+    def _mongo_helper_names(self, project_ir) -> set:
+        """Names of functions whose body directly hits a MongoDB sink."""
+        names: set = set()
+        if project_ir is None:
+            return names
+        for f in getattr(project_ir, "functions", []) or []:
+            for c in getattr(f, "calls", []) or []:
+                if c.name.split(".")[-1] in self._MONGO_CALLS:
+                    names.add(f.name)
+        return names
+
     def detect(self, fn, source_lines, project_ir):
         out = []
+        tainted = taint_names(fn)
         for call in fn.calls:
             base = call.name.split(".")[-1]
-            if base not in self._MONGO_CALLS:
-                continue
             joined = " ".join(call.args)
-            if fn.sources and ("request" in joined or _is_variable(call.args[0]) if call.args else False):
-                out.append(_build_vuln(
-                    self.category, fn.path, call.line,
-                    joined.strip(), "nosql",
-                    f"MongoDB query built from caller-controlled input in '{fn.name}'",
-                    "Validate query operators and avoid passing raw request dicts to the driver.",
-                    fn.name,
-                ))
-            elif self._OPERATOR_RE.search(joined) and fn.sources:
-                out.append(_build_vuln(
-                    self.category, fn.path, call.line,
-                    joined.strip(), "nosql",
-                    f"NoSQL operator injection surface in '{fn.name}'",
-                    "Sanitise query operators before passing them to the MongoDB driver.",
-                    fn.name,
-                ))
+            # -- direct MongoDB call in this function -----------------------
+            if base in self._MONGO_CALLS:
+                if call.args and fn.sources and (
+                    "request" in joined or _is_variable(call.args[0])
+                ):
+                    out.append(_build_vuln(
+                        self.category, fn.path, call.line,
+                        joined.strip(), "nosql",
+                        f"MongoDB query built from caller-controlled input in '{fn.name}'",
+                        "Validate query operators and avoid passing raw request dicts to the driver.",
+                        fn.name,
+                    ))
+                elif self._OPERATOR_RE.search(joined) and fn.sources:
+                    out.append(_build_vuln(
+                        self.category, fn.path, call.line,
+                        joined.strip(), "nosql",
+                        f"NoSQL operator injection surface in '{fn.name}'",
+                        "Sanitise query operators before passing them to the MongoDB driver.",
+                        fn.name,
+                    ))
+                continue
+            # -- v0.5.0: one-hop indirection into a MongoDB helper ----------
+            # Only treat a *free* function call (``helper(...)``) as a
+            # delegation — ``obj.helper(...)`` (e.g. ``ldap_conn.search``) must
+            # not collide with a helper that happens to share its basename.
+            if base in self._mongo_helper_names(project_ir) and call.name == base:
+                has_tainted_arg = False
+                if fn.sources:
+                    has_tainted_arg = True
+                elif tainted:
+                    has_tainted_arg = any(t and t in joined for t in tainted)
+                if has_tainted_arg:
+                    out.append(_build_vuln(
+                        self.category, fn.path, call.line,
+                        joined.strip(), "nosql",
+                        f"Caller-controlled input forwarded to a MongoDB query helper "
+                        f"('{base}') in '{fn.name}'",
+                        "Validate query operators and avoid passing raw request bodies to the driver.",
+                        fn.name,
+                    ))
         return out
 
 
@@ -2428,6 +2688,32 @@ class CORSMisconfigurationDetector(StructuredDetector):
         re.I,
     )
     _IDENTS = re.compile(r"\b[A-Za-z_]\w*\b")
+    # v0.5.0: FastAPI / Starlette ``app.add_middleware(CORSMiddleware, ...)``.
+    _FASTAPI_CORS_LINE = re.compile(r"\bCORSMiddleware\b")
+    _FASTAPI_WILDCARD = re.compile(
+        r"allow_origins\s*=\s*(?:\[\s*['\"]\*['\"]\s*\]|['\"]\*['\"])"
+        r"|allow_origin_regex\s*=\s*['\"]\.\*['\"]",
+        re.I,
+    )
+    _FASTAPI_CRED = re.compile(r"allow_credentials\s*=\s*True", re.I)
+
+    def _fastapi_cors_finding(self, fn, source_lines):
+        """Detect module-level ``CORSMiddleware`` with a wildcard + credentials.
+
+        Returns a (line, snippet) tuple when unsafe, else ``None``.  The window
+        is bounded to a few lines so two different middleware blocks cannot be
+        conflated.
+        """
+        for i, line in enumerate(source_lines):
+            stripped = line.strip()
+            if stripped.startswith(("import ", "from ")):
+                continue
+            if not self._FASTAPI_CORS_LINE.search(line):
+                continue
+            window = "\n".join(source_lines[i:i + 15])
+            if self._FASTAPI_WILDCARD.search(window) and self._FASTAPI_CRED.search(window):
+                return i + 1, stripped
+        return None
 
     def _tainted_names(self, fn) -> set:
         tainted: set = set(fn.parameters)
@@ -2442,6 +2728,21 @@ class CORSMisconfigurationDetector(StructuredDetector):
 
     def detect(self, fn, source_lines, project_ir):
         out = []
+        # v0.5.0: FastAPI / Starlette module-level CORSMiddleware.  This config
+        # lives outside any function, so scan the file (dedup collapses repeats
+        # across the per-function pipeline runs).
+        fw = self._fastapi_cors_finding(fn, source_lines)
+        if fw is not None:
+            line_no, snippet = fw
+            out.append(_build_vuln(
+                self.category, fn.path, line_no,
+                snippet, "web",
+                "FastAPI CORSMiddleware configured with wildcard origin "
+                "(allow_origins=['*'] or allow_origin_regex='.*') and allow_credentials=True",
+                "Restrict CORS origins to an explicit allowlist of trusted domains; "
+                "never combine a wildcard with credential support.",
+                fn.name,
+            ))
         body = self.code_text(fn, source_lines)
         if "Access-Control-Allow-Origin" not in body and "CORS(" not in body:
             return out
@@ -2899,6 +3200,24 @@ def scan_file_with_ir(path, project_ir: ProjectIR) -> List[Vulnerability]:
     ]
     for fn in target_fns:
         vulns.extend(pipeline.run(fn, source_lines, project_ir))
+
+    # 2b. v0.5.0: module-level pass for configuration-only files that contain
+    # no functions (e.g. ``config.py``).  Structured detectors only run against
+    # functions, so a module-level ``os.environ.get(..., "default-secret")``
+    # would otherwise be invisible.  Only whole-file scanners are rerun here.
+    if not target_fns:
+        module_fn = FunctionIR(
+            name="<module>",
+            qualified_name="<module>",
+            path=resolved,
+            line=1,
+            end_line=len(source_lines),
+        )
+        for det in (HardcodedSecretDetector(), CORSMisconfigurationDetector()):
+            try:
+                vulns.extend(det.detect(module_fn, source_lines, project_ir))
+            except Exception:
+                pass
 
     # 3. dedup
     seen: set = set()

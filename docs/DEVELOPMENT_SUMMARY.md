@@ -622,3 +622,52 @@ v0.4.3 的 `XSSDetector` 只在「返回语句所在行」检测 `return f"<html
 - 版本号 `0.4.3 → 0.4.4`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
 - 原有 283 个测试全部通过；新增 5 个，总计 288 个测试通过。
 
+
+---
+
+## 18. v0.5.0 第十轮 — FastAPI / Starlette 框架支持
+
+### 18.1 背景与目标
+
+前九个版本的检测器针对 Flask / Django 优化，对 FastAPI 应用存在系统性漏报：FastAPI 把用户输入表达为**路由处理函数的参数**（`def handler(name: str, user=Depends(...))`），而不是函数体内的 `request.args.*` 链式调用，既有的 `fn.sources` 信号只识别后者，因此 FastAPI 处理函数看起来"没有污点输入"。
+
+本轮在两个 FastAPI 靶场（`fastapi-target` / `fastapi-target2`）上确认了 7 类漏报，按优先级补齐。约束保持不变：纯标准库、不执行目标代码、现有 288 个测试与 Flask/Django 检测不下降。
+
+### 18.2 新增共享基础设施（`detectors.py`）
+
+- `is_route_handler(fn)`：识别 `@app.get/post/...` 与 `@bp.route(...)` 路由装饰器。
+- `taint_names(fn)`：轻量过程内污点集合。起点为路由处理函数参数（FastAPI 路径/查询/头输入）与 `request.*` 派生局部变量；沿 `lhs = rhs` 赋值做不动点传播；并把 `os.path.basename` / `secure_filename` 识别为净化器，使经其重赋值的变量脱污点。该函数只用于**新增**检测路径，绝不抑制既有结果。
+
+### 18.3 七类漏报修复
+
+1. **Open Redirect**（`OpenRedirectDetector`）：`_CALLS` 增加 `RedirectResponse`；支持 `RedirectResponse(url=next)` 关键字形式（剥掉 `url=` 前缀）；FastAPI 路由参数视为污点。
+2. **CORS Misconfiguration**（`CORSMisconfigurationDetector`）：新增模块级扫描，识别 `app.add_middleware(CORSMiddleware, allow_origins=["*"] | allow_origin_regex=".*", allow_credentials=True)`；固定域名不报；跳过 import 行。
+3. **Auth Bypass**（`AuthBypassDetector`）：管理路径正则放宽为 `/admin(?:[/\"']|$)`，覆盖 `/api/admin/...`；新增 `_signature_text()`，把函数签名中的 `Depends(...)` 识别为认证依赖；有 `Depends` 不报。
+4. **IDOR / BOLA**（`IDORDetector`）：`{path_param}` 路径参数经既有 `_ID_PARAM_RE` 识别并流入 `conn.execute(... WHERE id = ?, (pid,))`；新增 `_body_after_signature()` 把签名与函数体分离——签名里的 `Depends(current_user)` 只证明认证、不证明授权；新增 `_OWNERSHIP_RE` 识别 `row["owner_id"] != user["id"]` 之类的归属检查并抑制报告。
+5. **Path Traversal**（`PathTraversalDetector`）：sink 集合增加 `FileResponse`；配合 `taint_names` 识别 FastAPI 查询参数（经 `os.path.join` 传播到 `FileResponse(path)`）；Flask 既有 `fn.sources` 粗粒度门保持不变。
+6. **Hardcoded Secret**（`HardcodedSecretDetector`）：新增 `os.environ.get("KEY", "default")` 模式，仅当 LHS 含 secret/key/password/token 且默认值像真实密钥（长度≥8、字母+数字+符号混合，或 `sk_test_`/`whsec_`/`AKIA` 等前缀）才报；空默认 `""` 不报。
+7. **NoSQL Injection**（`NoSQLInjectionDetector`）：`request.json()` 本就被 `PY_SOURCE_PATTERNS` 识别为源；新增一跳跨函数追踪——把项目 IR 中会触发 `find/find_one/insert...` 的自由函数名收集起来，当路由处理函数把 `request.json()` 结果或路由参数传给这类 helper 时报告；只匹配**裸函数调用**（`helper(...)`），避免与 `ldap_conn.search(...)` 之类同名方法误撞。
+
+另在 `scan_file_with_ir()` 增加模块级兜底：对**不含任何函数**的纯配置文件（如 `config.py`）运行 `HardcodedSecretDetector` / `CORSMisconfigurationDetector`，否则模块级密钥默认值与中间件配置完全不可见。
+
+### 18.4 误报防范
+
+- CORS：仅通配源 + `allow_credentials=True` 才报；固定域名不报。
+- Auth bypass：仅路径含 `admin` 段且签名完全无 `Depends` 才报。
+- IDOR：函数体内存在归属比较则不报；只读越权读取也报。
+- Secret：仅默认值像真实密钥才报；`os.environ.get("K", "")` 不报。
+- NoSQL：跨函数只跟随一跳，且仅限裸函数名匹配。
+
+### 18.5 靶场复验
+
+- **fastapi-target2**：新增 open-redirect、cors-misconfiguration、auth-bypass、idor、path-traversal、hardcoded-secret（config.py 三个默认密钥）全部出现。
+- **fastapi-target**：nosql-injection 出现（POST `request.json()` 与 GET 路由参数两条路径）。
+- **sast-target**：保持 48 发现不下降（修复了 LDAP `conn.search` 与 mongo helper `search` 同名导致的一条新增误报）。
+- **app_remediated.py**：0 误报。
+
+### 18.6 测试与版本
+
+- 新增 `tests/fixtures/fastapi/vulnerable.py`（覆盖全部 7 类）与 `safe.py`（全部已缓解，必须 0 误报）。
+- 新增 `tests/test_fastapi_support.py` 共 13 个用例：七类各一、safe 夹具零误报、固定域名 CORS 不报、带 `Depends` 管理路由不报、带归属检查 IDOR 不报、空 env 默认不报。
+- 版本号 `0.4.4 → 0.5.0`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
+- 原 288 个测试全部通过；新增 13 个，总计 301 个测试通过。
