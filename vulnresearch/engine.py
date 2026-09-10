@@ -12,6 +12,7 @@ Backward compatibility is guaranteed:
 """
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -20,8 +21,24 @@ from .detectors import DetectorPipeline, scan_file, scan_file_with_ir
 from .ir import ProjectIR, extract_file
 from .models import Finding, Vulnerability
 
-DEFAULT_EXCLUDES = {".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__"}
+DEFAULT_EXCLUDES = {".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__",
+                    # v0.5.1: skip test trees.  Test helpers / fixtures issue outbound
+                    # HTTP calls (e.g. ``requests.post(GRAPHQL_URL, ...)``) that are
+                    # not application SSRF sinks.  Our own ``tests/fixtures/`` are read
+                    # directly by the unit tests via ``scan_file_with_ir`` and never
+                    # walked through ``ResearchEngine.files()``.
+                    "tests", "test", "__tests__"}
 DEFAULT_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".php", ".rb", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs"}
+
+# v0.5.1: filenames that are always test scaffolding regardless of directory.
+# We deliberately match only ``conftest.py`` here, not ``test_*.py`` /
+# ``*_test.py``: the regression baseline (``sast-target``) ships a top-level
+# POC script named ``test_vulnerabilities.py`` whose findings are part of the
+# "48 findings" floor, and blanket-excluding ``test_*.py`` would silently drop
+# that floor.  Test-code noise that matters in practice (graphql-target's 17
+# SSRF false positives) lives inside a ``tests/`` directory and is already
+# removed by ``DEFAULT_EXCLUDES`` above.
+_TEST_FILE_RE = re.compile(r"^conftest\.py$")
 
 # Severity weight used when clustering/selecting the "best" representative.
 _SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Info": 0}
@@ -89,6 +106,9 @@ class ResearchEngine:
             if not p.is_file() or p.suffix.lower() not in DEFAULT_EXTS:
                 continue
             if any(part in DEFAULT_EXCLUDES for part in p.parts):
+                continue
+            # v0.5.1: skip test-file scaffolding even outside a tests/ tree.
+            if p.suffix.lower() == ".py" and _TEST_FILE_RE.match(p.name):
                 continue
             count += 1
             yield p

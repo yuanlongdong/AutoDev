@@ -671,3 +671,60 @@ v0.4.3 的 `XSSDetector` 只在「返回语句所在行」检测 `return f"<html
 - 新增 `tests/test_fastapi_support.py` 共 13 个用例：七类各一、safe 夹具零误报、固定域名 CORS 不报、带 `Depends` 管理路由不报、带归属检查 IDOR 不报、空 env 默认不报。
 - 版本号 `0.4.4 → 0.5.0`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
 - 原 288 个测试全部通过；新增 13 个，总计 301 个测试通过。
+
+## 19. v0.5.1 第十一轮 — 三个新靶场漏报/误报修复
+
+### 19.1 背景与目标
+
+三个新接入靶场（`graphql-target`（DVGA，Flask+Graphene）、`crypto-target`（OWASP A02）、`jwt-target`（JWT Attack Lab））在 v0.5.0 基线上暴露出三类问题，按优先级补齐。约束保持不变：纯标准库、不执行目标代码、现有 301 个测试与回归基准不下降。
+
+### 19.2 修复一：SQL 注入经 SQLAlchemy `text()` 漏报（高）
+
+`SQLInjectionDetector._SQL_CALLS` 仅含 `execute/executemany/raw/query`，不识别 SQLAlchemy 的原始 SQL 构造函数 `text()`。`graphql-target/core/views.py` L320：
+
+```python
+result = result.filter(text("title = '%s' or content = '%s'" % (filter, filter)))
+```
+
+修复：
+- `_SQL_CALLS` 加入 `"text"`；legacy `RULES` 的 SQL 正则同步加入 `text`。
+- **关键排序修正**：把"动态构造判定"（f-string / `+` / `%` printf / `.format()`）移到"静态字面量占位符"判定**之前**。原顺序下 `"..." % (var)` 以引号开头且含 `%s`，被误判为"参数化查询"而跳过；修正后先识别动态构造再走参数化豁免。纯静态字面量 `text("SELECT 1")` 与命名绑定 `text("... WHERE name = :name")` 仍不报。
+
+### 19.3 修复二：硬编码 bytes 字面量未检测（高）
+
+`HardcodedSecretDetector` 只匹配字符串字面量，不识别 `b'...'` / `b"..."`。`crypto-target/app.py` L18-19 的 `AES_KEY = b'0123456789abcdef'`、`AES_IV = b'fedcba9876543210'` 漏报。
+
+修复：
+- 新增 `_BYTES_RE`：变量名含 `key/secret/password/passwd/token/credential/iv/aes`，右侧为 `b'...'`/`b"..."` 且长度 ≥ 8 字节时报告。短 bytes `b'x'`、7 字节 `b'1234567'`、无密钥语义的 `PLAINTEXT_BUFFER = b'...'` 不报。
+- legacy `RULES` 的 hardcoded-secret 正则引号前加可选 `b` 前缀，与结构化检测器在同一位置去重归一。
+
+### 19.4 修复三：SSRF 测试文件误报（中）
+
+`graphql-target` 扫描出 17 个 SSRF，全部来自 `tests/test_*.py` 与 `tests/common.py` 中对 `GRAPHQL_URL` 的测试请求，非真实漏洞。
+
+修复（`engine.py`）：
+- `DEFAULT_EXCLUDES` 增加 `"tests"`、`"test"`、`"__tests__"` 目录名。
+- 新增 `_TEST_FILE_RE` 文件名兜底：跳过 `conftest.py`。
+- **有意不收 `test_*.py` / `*_test.py`**：回归基准 `sast-target` 根目录自带一个 POC 脚本 `test_vulnerabilities.py`，其 3 个发现计入"48 发现"地板；全局排除 `test_*.py` 会把地板降到 45。graphql-target 的测试噪音全部位于 `tests/` 目录内，目录排除已足够将 SSRF 17 → 0。
+- 我们自己的 `tests/fixtures/` 由单元测试经 `scan_file_with_ir` 直接读取，从不经 `ResearchEngine.files()` 遍历，不受影响。
+
+### 19.5 未改动项（确认无需修复）
+
+- graphql-target `"%{}%".format(keyword)` 配合 `.like()` 是 ORM 参数化，不误报。
+- jwt-target 所有 `jwt.decode` 均指定 `algorithms=["RS256"]`，无算法混淆。
+- graphql-target `helpers.run_cmd('ps {}'.format(arg))` 命令注入已被既有检测器捕获。
+
+### 19.6 靶场复验
+
+- **graphql-target**：sql-injection 出现在 `core/views.py` L320；ssrf 17 → 0；总 .py 发现 29 → 8。
+- **crypto-target**：hardcoded-secret 1 → 3（`JWT_SECRET` + `AES_KEY` + `AES_IV`）。
+- **jwt-target**：保持 6 发现、4 类不变。
+- **sast-target**：保持 48 发现不下降。
+- **app_remediated.py**：0 误报。
+
+### 19.7 测试与版本
+
+- 新增 `tests/fixtures/v051/`（`text_sql.py` / `text_sql_safe.py` / `bytes_secret.py` / `bytes_secret_safe.py`）。
+- 新增 `tests/test_v051_fixes.py` 共 16 个用例：text() 四种动态构造各一、静态/命名绑定/参数化各一不报、不安全与安全夹具全量校验、bytes 密钥/IV 报告、短 bytes/非密钥名不报、引擎跳过 `tests/` 与 `conftest.py`、根级 `test_*.py` 保留（回归护栏）。
+- 版本号 `0.5.0 → 0.5.1`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
+- 原 301 个测试全部通过；新增 16 个，总计 317 个测试通过。

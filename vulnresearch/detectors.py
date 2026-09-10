@@ -10,7 +10,7 @@ from .knowledge_base import (
 )
 
 RULES = [
-    ("SQL Injection", "sql-injection", "High", re.compile(r"(?:execute|executemany|raw|query)\s*\([^\n]*(?:f['\"]|['\"][^'\"]*\+|\.format\()", re.I), "Use parameterized queries."),
+    ("SQL Injection", "sql-injection", "High", re.compile(r"(?:execute|executemany|raw|query|text)\s*\([^\n]*(?:f['\"]|['\"][^'\"]*\+|\.format\()", re.I), "Use parameterized queries."),
     ("Command Injection", "command-injection", "Critical", re.compile(
         r"(?:os\.system|os\.popen|"
         r"subprocess\.(?:run|Popen|call|check_output|check_call|getoutput|getstatusoutput)|"
@@ -36,7 +36,7 @@ RULES = [
         r"(?i)(?:api[_-]?key|secret(?:[_-]?key)?|password|passwd|token|"
         r"access[_-]?key|private[_-]?key|credential|"
         r"aws[_-]?(?:access|secret)(?:[_-]?key)?)"
-        r"\s*=\s*['\"][^'\"]{8,}['\"]"
+        r"\s*=\s*b?['\"][^'\"]{8,}['\"]"
     ), "Move secrets to a secret manager or environment configuration."),
     # v0.3.1: AWS Access Key IDs have a well-known fixed shape ``AKIA[0-A-Z]{16}``.
     ("AWS Access Key ID", "secret", "Critical", re.compile(r"AKIA[0-9A-Z]{16}\b"), "Move AWS credentials to IAM roles / a secrets manager."),
@@ -289,7 +289,12 @@ class SQLInjectionDetector(StructuredDetector):
     """Detect string-built SQL; ignore parameterised / ORM-safe calls."""
 
     category = "sql-injection"
-    _SQL_CALLS = {"execute", "executemany", "raw", "query"}
+    # v0.5.1: ``text`` is SQLAlchemy's raw-SQL constructor.  A static
+    # ``text("SELECT ... WHERE x = :name")`` is parameterised and stays
+    # unreported (see the literal-guard below); only ``text(f"...{v}...")``,
+    # ``text("..." % v)``, ``text("..." + v)`` or ``text("...{}".format(v))``
+    # are flagged.
+    _SQL_CALLS = {"execute", "executemany", "raw", "query", "text"}
     _ORM_SAFE = {"filter", "filter_by", "get", "get_or_404", "first", "all", "find_one", "find"}
     _SQL_VERBS = re.compile(r"\b(SELECT|INSERT|UPDATE|DELETE|WHERE|FROM)\b", re.IGNORECASE)
     # v0.4.0 – statement-level SQL pattern for the no-execute body scan.  This
@@ -341,10 +346,14 @@ class SQLInjectionDetector(StructuredDetector):
             if not args:
                 continue
             first = args[0]
-            # parameterised: static literal with placeholders + separate params
-            if _is_string_literal(first) and ("%s" in first or "?" in first or "%(" in first):
-                continue
-            # direct f-string / concatenation / printf-% in the call
+            # v0.5.1: dynamic construction patterns are checked *before* the
+            # static-literal guard.  ``"..." % (var)`` and ``"..." .format(var)``
+            # start with a quote and may even contain a ``%s`` placeholder, but
+            # the trailing operator means they are NOT parameterised — they are
+            # built SQL strings and must be flagged.  A pure static literal
+            # (no trailing ``%`` / ``+`` / ``.format``) with a placeholder is
+            # still recognised as parameterised below.
+            # direct f-string / concatenation / printf-% / .format() in the call
             if _is_fstring(first) or _has_concat(first) or self._PERCENT_SQL.search(first):
                 out.append(_build_vuln(
                     self.category, fn.path, call.line,
@@ -353,6 +362,9 @@ class SQLInjectionDetector(StructuredDetector):
                     "Use parameterised queries (placeholders) instead of string interpolation.",
                     fn.name,
                 ))
+                continue
+            # parameterised: pure static literal with placeholders + separate params
+            if _is_string_literal(first) and ("%s" in first or "?" in first or "%(" in first):
                 continue
             # variable holding dynamically-built SQL (e.g. query = f"..."; execute(query))
             if _is_variable(first) and body_has_dynamic:
@@ -935,6 +947,14 @@ class HardcodedSecretDetector(StructuredDetector):
         r"aws[_-]?(?:access|secret)(?:[_-]?key)?)"
         r"\s*=\s*['\"][^'\"]{6,}['\"]"
     )
+    # v0.5.1: bytes literals ``b'...'`` / ``b"..."``.  The keyword set extends
+    # the string-literal rule with ``iv`` and ``aes`` so that
+    # ``AES_KEY = b'0123456789abcdef'`` / ``AES_IV = b'...'`` are flagged; the
+    # value must be at least 8 bytes long so a short ``b'x'`` is ignored.
+    _BYTES_RE = re.compile(
+        r"(?i)\b[A-Za-z_][A-Za-z0-9_]*(?:key|secret|password|passwd|token|credential|iv|aes)"
+        r"[A-Za-z0-9_]*\s*=\s*b['\"][^'\"]{8,}['\"]"
+    )
     # AWS Access Key ID canonical format (prefix + 20 uppercase alnum / digits).
     _AKIA_RE = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
     # v0.5.0: ``SECRET = os.environ.get("KEY", "hardcoded-default")`` — the
@@ -976,6 +996,16 @@ class HardcodedSecretDetector(StructuredDetector):
                     line.strip(), "configuration",
                     f"Hardcoded secret literal detected: {m.group(0)[:60]}",
                     "Move secrets to environment variables or a dedicated secret manager.",
+                    fn.name,
+                ))
+                continue
+            # v0.5.1: bytes literal (e.g. ``AES_KEY = b'0123456789abcdef'``).
+            if self._BYTES_RE.search(line):
+                out.append(_build_vuln(
+                    self.category, fn.path, idx,
+                    line.strip(), "configuration",
+                    "Hardcoded bytes literal assigned to a key/secret/IV variable",
+                    "Move cryptographic keys and IVs to a key manager or environment variables.",
                     fn.name,
                 ))
                 continue
