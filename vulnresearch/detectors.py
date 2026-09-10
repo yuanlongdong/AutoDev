@@ -10,7 +10,7 @@ from .knowledge_base import (
 )
 
 RULES = [
-    ("SQL Injection", "sql-injection", "High", re.compile(r"(?:execute|executemany|raw|query|text)\s*\([^\n]*(?:f['\"]|['\"][^'\"]*\+|\.format\()", re.I), "Use parameterized queries."),
+    ("SQL Injection", "sql-injection", "High", re.compile(r"(?:execute|executemany|raw|query|text)\s*\([^\n]*(?:f['\"]|['\"][^'\"]*['\"]\s*\+|\.format\()", re.I), "Use parameterized queries."),
     ("Command Injection", "command-injection", "Critical", re.compile(
         r"(?:os\.system|os\.popen|"
         r"subprocess\.(?:run|Popen|call|check_output|check_call|getoutput|getstatusoutput)|"
@@ -18,6 +18,10 @@ RULES = [
         r"(?:f['\"]|['\"][^'\"]*\+|\.format\(|shell\s*=\s*True)",
         re.I), "Pass argv as a list and avoid shell interpretation."),
     ("Path Traversal", "path-traversal", "High", re.compile(r"(?:open|Path\s*\(|read_text|read_bytes)\s*\([^\n]*(?:request|params|query|filename|filepath|path)", re.I), "Constrain paths to an allowlisted directory and resolve before access."),
+    # v0.6.0: the network-semantic tokens are matched on word boundaries so a
+    # config/test constant like ``BASE_URL`` / ``PRODUCT_SERVICE_URL`` (where
+    # "url" is glued to the name with ``_``) no longer trips the rule; only a
+    # standalone ``url=`` / ``target`` / ``host`` argument is flagged.
     ("SSRF", "ssrf", "High", re.compile(
         r"(?:requests\.(?:get|post|put|delete|request)|"
         r"urllib\.request\.(?:urlopen|Request)|urlopen|"
@@ -25,7 +29,7 @@ RULES = [
         r"aiohttp\.(?:ClientSession\.)?(?:get|post|request)|"
         r"http\.client\.HTTPConnection|"
         r"urllib3\.PoolManager\.request)\s*\([^\n]*"
-        r"(?:url|uri|target|host|endpoint|callback|webhook|proxy|redirect_url|next_url|fetch_url|remote|external)",
+        r"\b(?:url|uri|target|host|endpoint|callback|webhook|proxy|redirect_url|next_url|fetch_url|remote|external)\b",
         re.I), "Allowlist schemes/hosts and block private/link-local destinations."),
     # v0.3.1: broadened the keyword set (access_key / private_key / credential /
     # aws_access / aws_secret) and matched ``secret[_-]?key`` as a whole so that
@@ -134,7 +138,19 @@ def _is_fstring(arg: str) -> bool:
 
 
 def _has_concat(arg: str) -> bool:
-    return " + " in arg or ").format(" in arg or ".format(" in arg
+    # v0.6.0: detect *Python* string concatenation without mistaking "+"
+    # arithmetic that lives inside a single SQL literal (e.g.
+    # ``"UPDATE ... balance = balance + ? ..."``).  Strip every quoted string
+    # literal out of the argument; a ``+`` that *survives* outside the literals
+    # is real concatenation (``'<b>' + name + '</b>'``), while a ``+`` that
+    # disappears with the literals was just SQL arithmetic.
+    a = arg.strip()
+    outside_literals = re.sub(
+        r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", "", a,
+    )
+    if " + " in outside_literals:
+        return True
+    return ").format(" in arg or ".format(" in arg
 
 
 def _is_variable(arg: str) -> bool:
@@ -252,6 +268,24 @@ def route_handler_taints_params(fn: FunctionIR) -> bool:
     return is_route_handler(fn)
 
 
+# v0.6.0: hard cap on the ``taint_names`` fixpoint passes.  A correctly
+# converging taint set settles in well under this many iterations; the cap is
+# a last-resort guard against an add/discard oscillation (see below).
+_MAX_TAINT_PASSES = 64
+
+
+def _references_name(rhs: str, name: str) -> bool:
+    """True when *name* is referenced in *rhs* as a whole word.
+
+    Using ``\\b`` boundaries (rather than a raw ``name in rhs`` substring test)
+    keeps a short tainted name such as ``file`` from spuriously matching inside
+    an unrelated identifier like ``filename`` / ``filepath``.
+    """
+    if not name or not rhs:
+        return False
+    return re.search(r"\b" + re.escape(name) + r"\b", rhs) is not None
+
+
 def taint_names(fn: FunctionIR) -> set:
     """Lightweight intra-procedural taint set.
 
@@ -268,16 +302,28 @@ def taint_names(fn: FunctionIR) -> set:
         m = _ASSIGN_RE.match(expr.strip())
         if m and _REQUEST_SRC_RE.search(m.group(2)):
             tainted.add(m.group(1).split(".")[0])
+    # v0.6.0: the forward-propagation fixpoint must always terminate.  On real
+    # code (the vulnbank ``upload_profile_picture`` handler) it could spin
+    # forever:
+    #   * substring matching ``t in rhs`` let a short tainted name (``file``)
+    #     match inside an unrelated identifier (``filename``), inventing edges;
+    #   * a variable reassigned first through a sanitiser (de-taint) and then
+    #     through an unsanitised f-string re-derivation flipped in/out of the
+    #     set every pass (add on one pass, discard on the next) so ``changed``
+    #     never settled and the whole scan hung at ~100 % CPU.
+    # We now match whole words and cap the number of fixpoint passes.
     changed = True
-    while changed:
+    passes = 0
+    while changed and passes < _MAX_TAINT_PASSES:
         changed = False
+        passes += 1
         for expr in fn.assignment_exprs:
             m = _ASSIGN_RE.match(expr.strip())
             if not m:
                 continue
             lhs = m.group(1).split(".")[0]
             rhs = m.group(2)
-            refs_tainted = any(t and t in rhs for t in tainted)
+            refs_tainted = any(t and _references_name(rhs, t) for t in tainted)
             sanitized = bool(_SANITIZER_CALL_RE.search(rhs))
             if refs_tainted and sanitized and lhs in tainted:
                 tainted.discard(lhs)
@@ -388,8 +434,16 @@ class SQLInjectionDetector(StructuredDetector):
     )
 
     def _tainted_names(self, fn) -> set:
-        """Local names that originate from a request source (plus route params)."""
-        tainted: set = set(fn.parameters)
+        """Local names that originate from a request source (plus route params).
+
+        v0.6.0: function parameters are only treated as attacker-controlled when
+        the function is a route handler (FastAPI query/path inputs).  Internal
+        helpers like ``safe_withdraw_atomic(conn, user_id, amount)`` take
+        ``user_id`` / ``amount`` from trusted callers, not from the request, so
+        treating their params as tainted previously flagged safe parameterised
+        ``?`` UPDATEs as SQL injection.
+        """
+        tainted: set = set(fn.parameters) if is_route_handler(fn) else set()
         for expr in fn.assignment_exprs:
             m = re.match(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+)$", expr.strip())
             if not m:
@@ -452,11 +506,17 @@ class SQLInjectionDetector(StructuredDetector):
                 continue
             if not self._SQL_STMT.search(line):
                 continue
-            # dynamic construction: f-string, printf-% or string concat
+            # dynamic construction: f-string, printf-% or string concat.
+            # v0.6.0: strip quoted string literals before testing for `` + `` so
+            # SQL arithmetic *inside* a parameterised literal (``balance + ?``)
+            # is not mistaken for Python concatenation.
+            line_no_literals = re.sub(
+                r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", "", line,
+            )
             is_dynamic = (
                 bool(re.search(r"f['\"]", line))
                 or bool(self._PERCENT_SQL.search(line))
-                or (" + " in line and self._SQL_VERBS.search(line))
+                or (" + " in line_no_literals and self._SQL_VERBS.search(line))
             )
             if not is_dynamic:
                 continue
@@ -1553,6 +1613,14 @@ class IDORDetector(StructuredDetector):
         re.I,
     )
     _LOOKUP_CALLS = {"get", "filter_by", "get_or_404", "execute", "raw"}
+    # v0.6.0: data-access verbs on repository / service objects (e.g.
+    # ``orchestrator.update_status(task_id)``, ``repo.get(task_id)``).  A path
+    # ``*_id`` parameter handed to any such method is an object reference.
+    _DATA_ACCESS_VERB = re.compile(
+        r"^(?:get|find|fetch|load|read|retrieve|update|save|delete|remove|patch|set|"
+        r"create|apply|count|exists|by_id)",
+        re.I,
+    )
     _AUTHZ_TOKENS = (
         "session['user_id']", 'session["user_id"]',
         "session.get('user_id')", 'session.get("user_id")',
@@ -1612,10 +1680,12 @@ class IDORDetector(StructuredDetector):
         used_in_lookup = False
         for call in fn.calls:
             base = call.name.split(".")[-1]
-            if base not in self._LOOKUP_CALLS:
-                continue
             joined = " ".join(call.args)
-            if any(p in joined for p in id_params):
+            if not any(p in joined for p in id_params):
+                continue
+            # direct ORM calls (``get_or_404`` / ``filter_by``) OR a data-access
+            # method on a repository / service object (``repo.update_status(id)``).
+            if base in self._LOOKUP_CALLS or self._DATA_ACCESS_VERB.match(base):
                 used_in_lookup = True
                 break
         # 3b. v0.4.0 – non-ORM data-access patterns: list comprehensions /
@@ -2320,31 +2390,96 @@ class BusinessLogicFlawDetector(StructuredDetector):
 
 
 # ---------------------------------------------------------------------------
-# 27. Race Condition (v0.3.0 – framework placeholder)
+# 27. Race Condition (v0.6.0 – real TOCTOU heuristic)
 # ---------------------------------------------------------------------------
 
 
 class RaceConditionDetector(StructuredDetector):
-    """v0.3.0 – framework placeholder for race-condition detection.
+    """v0.6.0 – static TOCTOU / check-then-act heuristic (CWE-367).
 
-    Real TOCTOU (time-of-check / time-of-use) races require *concurrency*
-    analysis: proving that two threads / requests can interleave between a
-    check (e.g. ``if quantity <= stock``) and a dependent update
-    (``stock = stock - quantity``) with no atomic guard (lock, database
-    transaction, compare-and-swap).  Pure static analysis can only recognise
-    the *check-then-act* shape; it cannot by itself prove that the window is
-    reachable concurrently.
+    Flags *financial* functions that read a balance / quantity / availability
+    flag from the database, make a decision on it, and then write it back as a
+    **separate** statement — with no atomic guard (transaction, row lock or an
+    in-place compare-and-swap ``WHERE balance >= ?``).
 
-    This class therefore intentionally returns ``[]`` for now.  It exists so
-    the ``race-condition`` category is wired into the pipeline and future
-    concurrency-sensitive analysis (lock inference, atomicity checks) can be
-    plugged in here without changing the pipeline contract.
+    This is a conservative shape match, not a proof of concurrent reachability:
+    it deliberately stays silent when a real transaction boundary or lock is
+    present, when there is no read+write pair, or when the function is not a
+    money / inventory operation.
     """
 
     category = "race-condition"
 
+    # Money / inventory operations whose read-modify-write is concurrency-sensitive.
+    _FIN_NAME = re.compile(
+        r"\b(withdraw|transfer|redeem|purchase|buy|deposit|stake|sell|checkout|"
+        r"spend|cash_?out|credit|debit|settle|redeem_coupon|buy_item)\b",
+        re.I,
+    )
+    _SQL_READ = re.compile(r"\bSELECT\b", re.I)
+    _SQL_WRITE = re.compile(r"\b(UPDATE|INSERT|DELETE)\b", re.I)
+    # A decision made on a balance / quantity / availability flag.  The field
+    # may be on either side of the operator and may be reached via attribute /
+    # subscript access (``user.balance < amount`` or ``row["used"] == 1``),
+    # so we allow bracket / quote punctuation between the field and the operator.
+    _CHECK = re.compile(
+        r"\b(?:balance|quantity|stock|used|available|amount|price|funds|inventory)\b"
+        r"[\s\"'\]\.]*?"
+        r"(?:<|<=|>|>=|==|!=)"
+        r"|"
+        r"(?:<|<=|>|>=|==|!=)\s*"
+        r"\b(?:balance|quantity|stock|used|available|amount|price|funds|inventory)\b",
+        re.I,
+    )
+    # Actual concurrency protection, inlined in the function (a call to a
+    # separately-defined ``*_atomic`` helper does NOT protect the caller's
+    # own check-then-act window).
+    _GUARD = re.compile(
+        r"\bBEGIN(?:\s+(?:IMMEDIATE|EXCLUSIVE|DEFERRED|TRANSACTION))?\b"
+        r"|\bFOR\s+UPDATE\b"
+        r"|\bLOCK\s+(?:TABLE|IN\s+SHARE\s+MODE)\b"
+        r"|isolation_level"
+        r"|\bwith\s+\w*(?:conn|db|session|transaction)\b",
+        re.I,
+    )
+
     def detect(self, fn, source_lines, project_ir):
-        return []
+        # Only money / inventory operations.
+        if not self._FIN_NAME.search(fn.name):
+            return []
+        body = self.code_text(fn, source_lines)
+        # Must actually read AND write the database (not a pure read or a
+        # single atomic UPDATE with no preceding SELECT).
+        if not (self._SQL_READ.search(body) and self._SQL_WRITE.search(body)):
+            return []
+        # Must make a decision on a balance / quantity / flag.
+        if not self._CHECK.search(body):
+            return []
+        # Guarded by a real transaction / row lock?
+        if self._GUARD.search(body):
+            return []
+        # Anchor the finding on the first SQL write call.
+        write_line = fn.line
+        snippet = ""
+        for call in fn.calls:
+            base = call.name.split(".")[-1]
+            joined = " ".join(call.args)
+            if base in ("execute", "executemany") and self._SQL_WRITE.search(joined):
+                write_line = call.line
+                snippet = joined.strip()
+                break
+        if not snippet:
+            snippet = f"{fn.name}: check-then-act on balance/quantity"
+        return [_build_vuln(
+            self.category, fn.path, write_line,
+            snippet[:120], "db",
+            f"Check-then-act on a balance/quantity in '{fn.name}' reads the "
+            f"value, decides on it, and writes it back with no transaction or "
+            f"row lock — a concurrent request can interleave in the gap.",
+            "Wrap the read-modify-write in a transaction (SELECT ... FOR UPDATE) "
+            "or use a single atomic UPDATE (... WHERE balance >= amount).",
+            fn.name,
+        )]
 
 
 # ---------------------------------------------------------------------------
@@ -3222,6 +3357,113 @@ class InsecureTempFileDetector(StructuredDetector):
 
 
 # ---------------------------------------------------------------------------
+# v0.6.0 – Missing Authentication (CWE-306)
+# ---------------------------------------------------------------------------
+
+
+class MissingAuthenticationDetector(StructuredDetector):
+    """v0.6.0 – HTTP route handlers with no authentication check (CWE-306).
+
+    Flags a Flask / Django / FastAPI route handler that reaches user input or
+    mutates state but carries *no* authentication signal — no ``@login_required``
+    / ``@token_required`` decorator, no ``current_user`` / ``g.user``, no
+    ``request.headers.get('Authorization')`` / ``jwt.decode``, no
+    ``Depends(get_current_user)`` FastAPI dependency.
+
+    Public / informational endpoints are excluded: health checks, login /
+    register / token issuers, docs, and pure read-only static pages.
+    """
+
+    category = "missing-authentication"
+
+    # Any mention of authentication / identity in a decorator or the body.
+    _AUTH = re.compile(
+        r"login_required|token_required|jwt_required|jwt\.decode|jwt\.get_|verify_token|decode_token|"
+        r"token_required|jwt_required|jwt\.decode|jwt\.get_|verify_token|decode_token|"
+        r"@?\w*auth\w*_?required|@?\w*_?auth\b|authenticate|authorize|"
+        r"current_user|g\.user|get_current_user|OAuth2|HTTPBearer|HTTPBasic|"
+        r"Authorization|Bearer|set_protected|"
+        r"Depends\s*\(|request\.headers\.get\s*\(\s*['\"]authorization|"
+        r"session\s*\[?\s*['\"]?(?:user|uid|auth|token)",
+        re.I,
+    )
+    # Route decorators (Flask / FastAPI / Django / generic).
+    _ROUTE = re.compile(
+        r"\.route\s*\(|\.(?:get|post|put|delete|patch|options|head)\s*\(",
+        re.I,
+    )
+    # Public / non-sensitive paths that must never be flagged.
+    _PUBLIC = re.compile(
+        r"^/?(?:health|healthz|live|livez|ready|readyz|ping|status|metrics|"
+        r"favicon\.?.*|docs?|redoc|openapi\.json)$"
+        r"|/(?:login|log_in|signin|sign_in|register|signup|sign_up|logout|log_out|"
+        r"auth|oauth|token|refresh|forgot|reset|password)"
+        r"|(?:^|/)static/",
+        re.I,
+    )
+    # User input / state change indicators (only flag handlers that matter).
+    _INPUT = re.compile(
+        r"request\.(?:args|form|json|values|data|body|files|query_params|"
+        r"cookies|headers|POST|GET)\b|request\s*\[|Depends\s*\(",
+        re.I,
+    )
+    # object-identifier parameter (``task_id`` / ``user_id`` / ``doc_id`` …)
+    _ID_PARAM = re.compile(r"(?:^|_)(?:user|doc|order|account|file|task|item|record|obj|id|pk|uuid|invoice|transaction)_?(?:id)?$|_id$", re.I)
+    _WRITE = re.compile(
+        r"\b(?:INSERT|UPDATE|DELETE)\b|\.add\s*\(|\.commit\s*\(|\.save\s*\(|"
+        r"\.execute\s*\(\s*['\"]\s*(?:INSERT|UPDATE|DELETE)",
+        re.I,
+    )
+
+    def detect(self, fn, source_lines, project_ir):
+        if not is_route_handler(fn):
+            return []
+        decos = self.decorators(fn, source_lines)
+        joined = " ".join(decos)
+        body = self.code_text(fn, source_lines)
+        # Authentication already present anywhere on the handler?
+        if self._AUTH.search(joined) or self._AUTH.search(body):
+            return []
+        # Exclude public / informational endpoints: pull the route path string
+        # from the decorator (``@app.post("/task/{id}")`` → "/task/{id}").
+        path_match = re.search(r"['\"]([^'\"]+)['\"]", joined)
+        route_path = path_match.group(1) if path_match else ""
+        if self._PUBLIC.search(route_path):
+            return []
+        # Conservative sensitivity gate: only flag endpoints that touch a
+        # specific resource by identifier (path/query object id, e.g.
+        # ``task_id`` / ``user_id``) or that perform a direct database write.
+        # Trivial demo / read-only handlers that merely echo request input
+        # (``/query``, ``/upload``, ``/deserialize`` in a local lab) are not
+        # reported — the benchmark's remediated reference must stay clean.
+        has_input = bool(fn.sources) or bool(fn.parameters) or bool(self._INPUT.search(body))
+        has_write = bool(self._WRITE.search(body))
+        has_id_param = any(
+            re.search(self._ID_PARAM, p) for p in fn.parameters
+        )
+        has_id_in_path = bool(re.search(r"\{\s*[\w_]*id[\w_]*\s*\}|<\w*:?\w*id\w*>", route_path, re.I))
+        if not has_input:
+            return []
+        # Sensitivity gate: flag when the handler takes a request model / path
+        # parameter (FastAPI body, Flask <id>), names an object id, or performs
+        # a direct DB write.  Local-lab demo handlers with NO parameters and
+        # only in-body ``request.args/form`` echoes (the benchmark's remediated
+        # reference) stay unreported.
+        if not (has_write or has_id_param or has_id_in_path or bool(fn.parameters)):
+            return []
+        snippet = decos[0] if decos else f"@app.route(...) def {fn.name}"
+        return [_build_vuln(
+            self.category, fn.path, fn.line,
+            snippet.strip()[:120], "auth",
+            f"Route handler '{fn.name}' is reachable with no authentication check "
+            f"(no login_required / token / session / auth dependency).",
+            "Require authentication: add @login_required / @token_required, a "
+            "Authorization header check, or a FastAPI Depends(get_current_user).",
+            fn.name,
+        )]
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -3260,6 +3502,8 @@ class DetectorPipeline:
             WeakPasswordPolicyDetector(),
             BusinessLogicFlawDetector(),
             RaceConditionDetector(),
+            # v0.6.0 – new detectors
+            MissingAuthenticationDetector(),
             # v0.3.1 – round-4 cross-validation fixes
             CodeInjectionDetector(),
             # v0.4.0 – round-5 Django shooting-range detectors

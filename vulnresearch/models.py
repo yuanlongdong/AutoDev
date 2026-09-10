@@ -268,7 +268,7 @@ def dump_sarif(findings: List[Any], tool_name: str = "AI Vulnerability Researche
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{
-            "tool": {"driver": {"name": tool_name, "version": "0.5.2"}},
+            "tool": {"driver": {"name": tool_name, "version": "0.6.0"}},
             "results": results,
         }],
     }, ensure_ascii=False, indent=2)

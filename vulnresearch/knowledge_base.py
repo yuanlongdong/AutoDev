@@ -168,6 +168,9 @@ VULN_CATEGORIES: Dict[str, Dict[str, str]] = {
 
     # --- Authentication (10) ---
     "auth-bypass": {"title": "Authentication Bypass", "group": "authentication", "default_severity": "Critical", "cwe": "CWE-287"},
+    # v0.6.0 – route handlers that reach user input / state-changing operations
+    # with no authentication check at all (CWE-306).
+    "missing-authentication": {"title": "Missing Authentication for Function", "group": "authentication", "default_severity": "Medium", "cwe": "CWE-306"},
     "session-fixation": {"title": "Session Fixation", "group": "authentication", "default_severity": "Medium", "cwe": "CWE-384"},
     "weak-session": {"title": "Weak Session Management", "group": "authentication", "default_severity": "Medium", "cwe": "CWE-330"},
     "jwt-flaws": {"title": "JWT Implementation Flaw", "group": "authentication", "default_severity": "High", "cwe": "CWE-347"},
@@ -189,7 +192,7 @@ VULN_CATEGORIES: Dict[str, Dict[str, str]] = {
     "object-level-authz-failure": {"title": "Object-Level Authorization Failure", "group": "authorization", "default_severity": "High", "cwe": "CWE-862"},
 
     # --- Business Logic (9) ---
-    "race-condition": {"title": "Race Condition", "group": "business-logic", "default_severity": "High", "cwe": "CWE-362"},
+    "race-condition": {"title": "Race Condition (TOCTOU)", "group": "business-logic", "default_severity": "Medium", "cwe": "CWE-367"},
     "replay": {"title": "Replay Attack", "group": "business-logic", "default_severity": "Medium", "cwe": "CWE-294"},
     "double-spend": {"title": "Double Spend", "group": "business-logic", "default_severity": "High", "cwe": "CWE-362"},
     "coupon-abuse": {"title": "Coupon / Promo Abuse", "group": "business-logic", "default_severity": "Medium", "cwe": "CWE-840"},

@@ -775,3 +775,77 @@ result = result.filter(text("title = '%s' or content = '%s'" % (filter, filter))
 - 新增 `tests/test_v052_fixes.py` 共 12 个用例：别名映射解析（`as` 与 `from...import as`）、`req.get(url)`/`req.post(callback)` 报告、`req.post(data)` 不报、`from requests import get as g` 报告；`url_for('字面量')` 不报、`redirect(var)` 报告、`redirect('/literal')` 不报、FastAPI `RedirectResponse(url=next)` 仍报告、`url_for(var)` 仍报告；两个夹具端到端计数校验。
 - 版本号 `0.5.1 → 0.5.2`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
 - 原 317 个测试全部通过；新增 12 个，总计 329 个测试通过。
+
+
+## 21. v0.6.0 第十三轮 — 高级检测器 + 性能卡死 / 误报修复
+
+### 21.0 概述
+
+第十三个攻坚轮聚焦四个新靶场（vulnbank / race / microservice / phonemoney）暴露的问题：一个**性能卡死**（vulnbank `app.py` 扫描 >10 分钟 99% CPU）、两个**占位检测器**需要落地（竞态条件、缺少认证）、以及两类**误报**（SQL `?` 参数化查询、SSRF 常量 URL / 测试脚本）。本轮新增 2 个真实检测器、1 个 IDOR 覆盖增强、5 处误报/性能修复，版本 `0.5.2 → 0.6.0`。
+
+### 21.1 性能卡死：`taint_names` 不动点不收敛（最高优先级）
+
+**现象**：`python -m vulnresearch.cli vulnbank-target/app.py` 运行 >10 分钟 99% CPU 不返回，其余文件（auth.py、merchant_payments.py）正常。`faulthandler.dump_traceback_later(12)` 抓到实时栈：卡在 `detectors.py:taint_names`（`PathTraversalDetector.detect` 调用）。
+
+**根因**（二分定位到 `upload_profile_picture(current_user)`，72 函数中唯一卡死）：
+1. `taint_names` 用**子串匹配** `t in rhs` 传播污点：短名 `file` 会匹配进无关标识符 `filename` / `file_path`，凭空造出污点边。
+2. 该函数先 `filename = secure_filename(file.filename)`（去污点分支），再 `filename = f"...{random...}_{filename}"`（重新污点分支）。每轮不动点：一轮把 `filename` 加回污点、下一轮又因 `secure_filename` 丢弃 → `changed` 永远为真，**add/discard 震荡**，死循环。
+
+**修复**（`detectors.py`）：
+- 新增 `_references_name(rhs, name)`：用 `\b<name>\b` 整词边界匹配，短名 `file` 不再误伤 `filename`。
+- `taint_names` 的 `while changed` 改为 `while changed and passes < _MAX_TAINT_PASSES`（上限 64 轮）兜底。
+- 修复后 vulnbank `app.py` **1.1 s** 扫完（33 发现），从 >10 分钟降到 1 秒级。
+
+### 21.2 新增：竞态条件检测器（RaceConditionDetector，原占位符）
+
+把返回 `[]` 的框架占位换成**静态 TOCTOU 启发式**（CWE-367，Medium）。报告条件（全部满足）：
+- 函数名含金融/库存动词：`withdraw|transfer|redeem|purchase|buy|deposit|...`；
+- 函数体同时存在 SQL 读（`SELECT`）与 SQL 写（`UPDATE|INSERT|DELETE`）；
+- 存在对 balance / quantity / used / amount 等的比较判断（`if row["used"] == 1`、`if user.balance < amount`，支持 `obj["field"]` / `obj.field` 访问后比较）；
+- 体内**没有**真正的并发保护：`BEGIN [IMMEDIATE|EXCLUSIVE]` / `FOR UPDATE` / `LOCK TABLE` / `isolation_level` / `with conn/db/session`。
+
+**误报防护**：纯读函数、非金融函数、或体内已含事务/行锁的函数（`fixes/atomic_update.py`、`fixes/locking_example.py` 等安全变体）一律不报；调用外部 `*_atomic` 辅助函数不算保护（因为真正的 check-then-act 窗口仍在调用方）。
+
+### 21.3 新增：缺少认证检测器（MissingAuthenticationDetector）
+
+识别 Flask `@app.route` / FastAPI `@app.get/post` / Django 路由处理函数，若装饰器与函数体**均无**认证信号（`login_required`/`token_required`/`jwt`/`current_user`/`Depends(...)`/`Authorization`/`session['user']` 等），且端点消费用户输入或变更状态，则报 `missing-authentication`（CWE-306，Medium）。
+
+**排除**：
+- health check（`/health` `/healthz` `/ping` `/status` `/metrics` 等）与登录/注册/`/token`/`/docs` 本身；
+- 纯静态、无参数、体内只 `request.args/form` 回显的本地实验 demo 端点（保持 `app_remediated.py` 0 误报）。
+
+**敏感度门**：只有当处理函数携带请求模型 / 路径参数（FastAPI body、Flask `<id>`）、或命名对象 id、或直接 DB 写时才报——避免把"安全参考实现"的演示端点误报。
+
+### 21.4 误报修复一：SQL `?` 参数化查询被误报为 SQL 注入
+
+`db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (reward, user_id))` 是 SQLite 参数化查询，`?` 为占位符，安全。三处误报来源一并修复：
+1. `_has_concat(arg)` 原先用 `" + " in arg` 子串判定拼接，把 SQL 串内部的 `balance + ?` 算术当成 Python 字符串拼接。改为**先剥离所有引号字符串字面量**，只看字面量之外是否还有 ` + `。
+2. 遗留行级正则 `['\"][^'\"]*\+` 缺闭合引号，把字面量内的 `+` 当拼接。改为 `['\"][^'\"]*['\"]\s*\+`（要求闭合引号后再 `+`）。
+3. `SQLInjectionDetector` 第二条（无 execute 的行扫描）`" + " in line` 同样先剥离字面量；并把 `_tainted_names` 的参数污点限制为**仅路由处理函数**（内部辅助函数 `safe_withdraw_atomic(conn, user_id, amount)` 的参数不是请求输入）。
+
+### 21.5 误报修复二：SSRF 常量 URL / 测试脚本噪声
+
+两类误报：
+- **服务间常量 URL**（microservice `PRODUCT_SERVICE_URL = os.getenv(...)` 后 `requests.get(f'{PRODUCT_SERVICE_URL}/...')`）：URL 来自环境配置而非请求。遗留 SSRF 正则把 `url` 词元改为**整词匹配**（`\b(?:url|uri|target|host|...)\b`），`PRODUCT_SERVICE_URL` / `BASE_URL` 中 glued 的 `_url` 不再命中。
+- **测试 / 利用脚本**（race-target 根目录 `test_all_features.py`、`exploits/*.py`）：客户端代码 `requests.get(f'{BASE_URL}/...')`。`engine.DEFAULT_EXCLUDES` 新增 `exploits` 目录；`BASE_URL`/`TARGET` 测试常量经整词匹配自然消除。
+- 保留根目录 `test_*.py` 不全局排除（sast-target 的 `test_vulnerabilities.py` POC 计入 48 基线，回归护栏 `test_engine_keeps_root_test_script` 仍通过）。
+
+### 21.6 增强：IDOR 识别 repository 方法名
+
+`IDORDetector` 的 `_LOOKUP_CALLS` 只认 `get/filter_by/get_or_404/execute/raw`，漏报 FastAPI 中 `orchestrator.update_status(task_id, ...)` / `.apply_step_result(task_id, ...)` 这类数据访问方法。新增 `_DATA_ACCESS_VERB` 前缀表（`get|find|fetch|load|read|retrieve|update|save|delete|...|apply`），路径 `*_id` 参数传入任一此类方法即视为对象引用。
+
+### 21.7 靶场复验
+
+- **vulnbank-target**：`app.py` 1.1 s 扫完（<60 s 要求），33 发现。
+- **race-target**：race-condition 检出 3 个（wallet `withdraw` / coupon `redeem_coupon` / stock `buy_item`）；SQL `?` 参数化误报清零；测试文件 SSRF 噪声清零（exploits/ 已排除）。
+- **microservice-target**：`PRODUCT_SERVICE_URL` 常量 SSRF 误报消除，仅剩真实 `views.py fetch_review` SSRF。
+- **phonemoney-target**：missing-authentication 检出 11 个端点（`/health` 与只读 list 端点排除）；IDOR 检出 3 个 `{task_id}` 端点（next/update/result）。
+- **sast-target**：保持 51 发现（≥48 不下降）。
+- **app_remediated.py**：保持 0 误报。
+
+### 21.8 测试与版本
+
+- 新增 `tests/fixtures/v060/`（`race_condition.py` / `missing_auth.py` / `sql_param.py` / `ssrf_const.py`）。
+- 新增 `tests/test_v060_fixes.py` 共 11 个用例：TOCTOU 报告 / 事务保护不报 / 非金融函数不报；无认证端点报告 / `Depends` 不报 / health 不报；SQL `?` 参数化不报、动态拼接仍报；SSRF 配置常量不报、请求 URL 仍报；`taint_names` 震荡回归不卡死。
+- 版本号 `0.5.2 → 0.6.0`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
+- 原 329 个测试全部通过；新增 11 个，总计 340 个测试通过。

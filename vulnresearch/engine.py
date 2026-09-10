@@ -27,7 +27,11 @@ DEFAULT_EXCLUDES = {".git", ".venv", "venv", "node_modules", "dist", "build", "_
                     # not application SSRF sinks.  Our own ``tests/fixtures/`` are read
                     # directly by the unit tests via ``scan_file_with_ir`` and never
                     # walked through ``ResearchEngine.files()``.
-                    "tests", "test", "__tests__"}
+                    "tests", "test", "__tests__",
+                    # v0.6.0: exploit / proof-of-concept scripts hammer the target
+                    # (``requests.post(TARGET, ...)``) from an attacker machine; they
+                    # are never application code and produce pure SSRF noise.
+                    "exploits"}
 DEFAULT_EXTS = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".php", ".rb", ".rs", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs"}
 
 # v0.5.1: filenames that are always test scaffolding regardless of directory.
