@@ -143,6 +143,72 @@ def _is_variable(arg: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# v0.5.2 – import alias resolution
+# ---------------------------------------------------------------------------
+#
+# Network libraries are very commonly imported under a short alias, e.g.
+# ``import requests as req`` and then ``req.get(url)``.  The sink set matches
+# the fully-qualified ``requests.get`` name, so aliased calls were invisible
+# (the Pentrix webhook blind-SSRF was missed for exactly this reason).
+#
+# These helpers parse import *statement strings* (already captured by the IR)
+# into an ``alias -> fully-qualified target`` map.  No code is executed.
+
+# Top-level package roots known to make outbound network requests.
+_NETWORK_MOD_PREFIXES = ("requests", "httpx", "aiohttp", "urllib3", "urllib")
+
+
+def _import_alias_map(imports) -> dict:
+    """Map a short alias to the module / fully-qualified name it refers to.
+
+    Handles::
+
+        import requests as req          -> {"req": "requests"}
+        import requests                 -> {"requests": "requests"}
+        import a, b as c, d             -> {"a": "a", "c": "b", "d": "d"}
+        from requests import get        -> {"get": "requests.get"}
+        from requests import post as p  -> {"p": "requests.post"}
+    """
+    alias: dict = {}
+    for imp in imports or []:
+        if not isinstance(imp, str):
+            continue
+        s = imp.strip().rstrip(";")
+        m = re.match(r"^import\s+(.+)$", s)
+        if m:
+            for part in m.group(1).split(","):
+                part = part.strip()
+                pm = re.match(r"^([\w\.]+)(?:\s+as\s+(\w+))?$", part)
+                if not pm:
+                    continue
+                mod = pm.group(1)
+                asname = pm.group(2) or mod.split(".")[0]
+                alias[asname] = mod
+            continue
+        m = re.match(r"^from\s+([\w\.]+)\s+import\s+(.+)$", s)
+        if m:
+            mod = m.group(1)
+            for part in m.group(2).split(","):
+                part = part.strip()
+                pm = re.match(r"^(\w+)(?:\s+as\s+(\w+))?$", part)
+                if not pm:
+                    continue
+                orig = pm.group(1)
+                asname = pm.group(2) or orig
+                alias[asname] = f"{mod}.{orig}"
+    return alias
+
+
+def _is_network_alias(root: str, alias_map: dict) -> bool:
+    """True when *root* (the first dotted component of a call name) aliases a
+    network-request library module."""
+    target = alias_map.get(root)
+    if target is None:
+        return False
+    return any(target == p or target.startswith(p + ".") for p in _NETWORK_MOD_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
 # v0.5.0 – FastAPI / Starlette support helpers
 # ---------------------------------------------------------------------------
 #
@@ -533,11 +599,26 @@ class SSRFDetector(StructuredDetector):
 
     def detect(self, fn, source_lines, project_ir):
         out = []
+        # v0.5.2: resolve ``import requests as req`` style aliases from both the
+        # function body (local imports) and the module scope (project IR).
+        fn_imports = list(getattr(fn, "imports", []) or [])
+        proj_imports = list(getattr(project_ir, "imports", []) or [])
+        alias_map = _import_alias_map(fn_imports + proj_imports)
         for call in fn.calls:
             name = call.name
             base = name.split(".")[-1]
+            root = name.split(".")[0]
             # Condition 1 — known network-request function
             is_network = name in self._CALLS
+            if not is_network:
+                # v0.5.2: aliased module import, e.g. ``import requests as req``
+                # then ``req.get(url)``.  The method must still be a known HTTP
+                # verb so a benign ``req.get(data)`` on a plain object is safe.
+                if _is_network_alias(root, alias_map) and base in self._BASE_OK:
+                    is_network = True
+                # v0.5.2: ``from requests import get as g`` then bare ``g(url)``.
+                elif root == name and alias_map.get(root) in self._CALLS:
+                    is_network = True
             if not is_network:
                 # aiohttp.ClientSession.get / aiohttp.request
                 if "ClientSession" in name and base in self._BASE_OK:
@@ -1269,6 +1350,9 @@ class OpenRedirectDetector(StructuredDetector):
     category = "open-redirect"
     _CALLS = {"redirect", "HttpResponseRedirect", "RedirectResponse"}
     _URL_KWARG = re.compile(r"^url\s*=\s*(.+)$", re.S)
+    # v0.5.2: ``url_for("endpoint")`` — capture the call so we can inspect
+    # whether the endpoint argument is a static string literal.
+    _URL_FOR_CALL = re.compile(r"^url_for\s*\((.*)\)\s*$", re.S)
 
     def detect(self, fn, source_lines, project_ir):
         out = []
@@ -1285,6 +1369,18 @@ class OpenRedirectDetector(StructuredDetector):
             m = self._URL_KWARG.match(first.strip())
             if m:
                 first = m.group(1).strip()
+            # v0.5.2: ``redirect(url_for("static_endpoint"))`` builds an internal
+            # route URL from a string literal — it is never attacker controlled
+            # and must not be flagged.  Only ``url_for(dynamic_var)`` deserves
+            # taint analysis; in that case we fall through treating the endpoint
+            # expression itself as the redirect target.
+            m2 = self._URL_FOR_CALL.match(first.strip())
+            if m2:
+                inner = m2.group(1).strip()
+                endpoint = inner.split(",")[0].strip()
+                if _is_string_literal(endpoint):
+                    continue
+                first = endpoint
             if not _is_variable(first) or _is_string_literal(first):
                 continue
             root = first.split("[")[0].split(".")[0]

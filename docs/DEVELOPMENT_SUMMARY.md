@@ -728,3 +728,50 @@ result = result.filter(text("title = '%s' or content = '%s'" % (filter, filter))
 - 新增 `tests/test_v051_fixes.py` 共 16 个用例：text() 四种动态构造各一、静态/命名绑定/参数化各一不报、不安全与安全夹具全量校验、bytes 密钥/IV 报告、短 bytes/非密钥名不报、引擎跳过 `tests/` 与 `conftest.py`、根级 `test_*.py` 保留（回归护栏）。
 - 版本号 `0.5.0 → 0.5.1`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
 - 原 301 个测试全部通过；新增 16 个，总计 317 个测试通过。
+
+## 20. v0.5.2 第十二轮 — SSRF 别名漏报 / 开放重定向误报修复
+
+### 20.1 背景与目标
+
+三个高危靶场（`pentrix-target`（PenTrix，Flask，6723 行 / 14 个 route 文件）、`chain-target`（Flask 漏洞利用链，3118 行）、`pickle-cookie-target`（pickle cookie RCE，82 行））在 v0.5.1 基线上暴露出两类结构性问题。约束不变：纯标准库、不执行目标代码、现有 317 个测试与回归地板不下降。
+
+### 20.2 修复一：SSRF 别名导入漏报（高）
+
+`SSRFDetector._CALLS` 只匹配全限定名 `requests.get/post/...`。Pentrix 的盲打 SSRF 在**函数内部**局部 `import requests as req`，随后 `req.get(url)` / `req.post(callback_url, ...)` 调用名是 `req.get` / `req.post`，根段 `req` 不在 sink 集合里，全部漏报（基线 ssrf=0）。
+
+根因有两层：
+1. IR 只在 `ProjectIR.imports` 平铺收集 import 语句，**函数体内的局部 import 没有归属到具体函数**，检测器无法知道 `req` 是 `requests` 的别名。
+2. 检测器没有"别名 → 全限定名"的解析步骤。
+
+修复：
+- **IR 层（`ir.py`）**：`FunctionIR` 新增默认字段 `imports: List[str]`（向后兼容）。`visit_Import` / `visit_ImportFrom` 在函数栈内时，把语句同时追加到 `_stack[-1].imports`，使局部 `import requests as req` 能被该函数的检测器看到。
+- **检测器层（`detectors.py`）**：新增 `_import_alias_map(imports)`，纯字符串解析 `import requests as req` / `import a, b as c` / `from requests import get as g` / `from requests import post as p`，产出 `别名 -> 模块或全限定名` 映射；新增 `_is_network_alias(root, map)` 判断调用名首段是否指向网络库（requests / httpx / aiohttp / urllib3 / urllib）。
+- `SSRFDetector.detect` 在 `fn.imports + project_ir.imports` 上构建别名表：当调用名 `req.post(url)` 的首段 `req` 是网络库别名、且方法段 `post` ∈ `{get,post,put,delete,request,urlopen}` 时视为网络调用；`from requests import get as g` 后裸调 `g(url)` 也识别。
+- **保留网络语义守卫**：第一参数仍须含 `url/uri/target/host/endpoint/callback/webhook/proxy/...` 词元。因此 `req.get(data)`（`data` 无网络语义）不报，避免把普通对象方法误判为 SSRF。
+
+### 20.3 修复二：开放重定向 `url_for('字面量')` 误报（高）
+
+`OpenRedirectDetector` 把 `redirect(url_for("auth.login"))` 的实参表达式 `url_for("auth.login")` 当作"变量"，只要该处理函数里出现过任意 `request.*` 源就报告。但 `url_for` 的端点参数是**字符串字面量**，产出的是内部路由 URL，非攻击者可控，属误报（chain-target 4 条、pickle-cookie 2 条全为此类）。
+
+修复：
+- 新增 `_URL_FOR_CALL` 正则，在解包 `RedirectResponse(url=...)` 关键字形参之后识别 `url_for(<inner>)`。
+- 取 `inner` 的第一个位置参数（忽略 `_external=True` 等尾随关键字）：
+  - 若为字符串字面量 → **跳过**（`url_for("auth.login")` 安全内部路由）。
+  - 若为动态变量 → 把该变量作为重定向目标继续做污点判断（`url_for(endpoint_var)` 仍可能危险）。
+- 字符串字面量路径 `redirect("/login")` 本就被 `_is_string_literal` 跳过，保持不变。
+- **FastAPI 回归护栏**：`RedirectResponse(url=next)`（`next` 为路由处理函数参数）在关键字解包后仍走原有污点判定，继续报告。
+
+### 20.4 靶场复验
+
+- **pentrix-target**：ssrf 0 → 4。新捕获的 4 条全部为真实别名 SSRF：`tools.py` `fetch_url`（BONUS-SSRF-C01/C03）、`webhook`（BONUS-SSRF-C04）、`safe_fetch`（BONUS-SSRF-C05），以及 `advanced.py` `webhook_ssrf_redis`（CH17-C13）。任务预估至少 2 条，实际同型别名调用一并检出，均为真阳性；.py 发现 76 → 80，类别 22 → 23。
+- **chain-target**：open-redirect 4 → 0（4 条全为 `redirect(url_for("静态端点"))`）；.py 发现 45 → 41。
+- **pickle-cookie-target**：open-redirect 2 → 0（`redirect(url_for('login'))` / `redirect(url_for('index'))`）；.py 发现 6 → 4。
+- **sast-target**：保持 48 发现不下降。
+- **app_remediated.py**：保持 0 误报。
+
+### 20.5 测试与版本
+
+- 新增 `tests/fixtures/v052/`（`ssrf_alias.py` / `open_redirect.py`）。
+- 新增 `tests/test_v052_fixes.py` 共 12 个用例：别名映射解析（`as` 与 `from...import as`）、`req.get(url)`/`req.post(callback)` 报告、`req.post(data)` 不报、`from requests import get as g` 报告；`url_for('字面量')` 不报、`redirect(var)` 报告、`redirect('/literal')` 不报、FastAPI `RedirectResponse(url=next)` 仍报告、`url_for(var)` 仍报告；两个夹具端到端计数校验。
+- 版本号 `0.5.1 → 0.5.2`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
+- 原 317 个测试全部通过；新增 12 个，总计 329 个测试通过。

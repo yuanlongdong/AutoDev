@@ -54,6 +54,11 @@ class FunctionIR:
     loops: List[dict] = field(default_factory=list)
     exceptions: List[dict] = field(default_factory=list)
     class_name: str = ""
+    # v0.5.2: import statements that appear *inside* this function body (e.g.
+    # ``import requests as req`` inside a route handler).  Defaulted for
+    # backward compatibility so old hand-built FunctionIR objects keep working.
+    # Module-level imports still live on ``ProjectIR.imports``.
+    imports: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -280,14 +285,22 @@ class _PythonExtractor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import):
         try:
-            self.imports.append(ast.unparse(node))
+            text = ast.unparse(node)
+            self.imports.append(text)
+            # v0.5.2: attribute function-local imports to the enclosing function
+            # so per-function detectors can resolve ``import requests as req``.
+            if self._stack:
+                self._stack[-1].imports.append(text)
         except Exception:
             pass
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
         try:
-            self.imports.append(ast.unparse(node))
+            text = ast.unparse(node)
+            self.imports.append(text)
+            if self._stack:
+                self._stack[-1].imports.append(text)
         except Exception:
             pass
         self.generic_visit(node)
