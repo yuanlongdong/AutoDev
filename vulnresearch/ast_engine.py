@@ -14,6 +14,12 @@ class ASTResearchEngine:
         self.max_files = max_files
 
     def files(self) -> Iterable[Path]:
+        # v0.3.1: ``root`` may point at a single .py file — ``rglob`` never
+        # yields the file itself, so handle that case directly.
+        if self.root.is_file():
+            if self.root.suffix.lower() == ".py":
+                yield self.root
+            return
         count = 0
         excludes = {".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__"}
         for path in self.root.rglob("*"):

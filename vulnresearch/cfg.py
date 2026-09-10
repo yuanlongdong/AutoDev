@@ -1,132 +1,162 @@
-"""Conservative basic-block CFG builder for Python source.
+"""Lightweight control-flow graph (CFG) construction from AST facts.
 
-This is structural analysis only. It does not execute target code and models
-common control-flow constructs conservatively so later reachability analysis
-can reason about possible paths without pretending to know runtime values.
+This builds a *simplified* CFG: basic blocks are line-range segments split at
+the branch points recorded on :class:`~vulnresearch.ir.FunctionIR` (if/elif,
+loops, try/except, early returns).  Edges model linear fall-through, the
+true/false branches of conditionals, loop back-edges and exception handlers.
+No SSA is built — only blocks and edges, as required for reachability and
+counter-evidence checks.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
-import ast
+from typing import Dict, List, Set
 
-
-@dataclass(frozen=True)
-class BasicBlock:
-    id: int
-    statements: Tuple[str, ...]
-    start_line: int
-    end_line: int
-
-
-@dataclass(frozen=True)
-class CFGEdge:
-    source: int
-    target: int
-    kind: str = "normal"
+from .ir import FunctionIR
 
 
 @dataclass
-class FunctionCFG:
-    name: str
+class BasicBlock:
+    """A straight-line sequence of statements with a single entry and exit."""
+
+    id: int
+    start_line: int
+    end_line: int
+    statements: List[str] = field(default_factory=list)
+    predecessors: List[int] = field(default_factory=list)
+    successors: List[int] = field(default_factory=list)
+
+
+@dataclass
+class ControlFlowGraph:
+    """A function-level control-flow graph."""
+
     blocks: List[BasicBlock] = field(default_factory=list)
-    edges: List[CFGEdge] = field(default_factory=list)
-    entry: Optional[int] = None
-    exits: Set[int] = field(default_factory=set)
+    entry_block: int = 0
+    function_name: str = ""
 
 
-class _Builder:
-    def __init__(self):
-        self.blocks: List[BasicBlock] = []
-        self.edges: List[CFGEdge] = []
+class CFGBuilder:
+    """Construct a :class:`ControlFlowGraph` from a :class:`FunctionIR`."""
 
-    def block(self, statements: List[ast.stmt]) -> int:
-        if not statements:
-            statements = []
-        text = []
-        for stmt in statements:
-            try:
-                text.append(ast.unparse(stmt))
-            except Exception:
-                text.append(type(stmt).__name__)
-        lines = [getattr(s, "lineno", 0) for s in statements]
-        end_lines = [getattr(s, "end_lineno", getattr(s, "lineno", 0)) for s in statements]
-        idx = len(self.blocks)
-        self.blocks.append(BasicBlock(idx, tuple(text), min(lines or [0]), max(end_lines or [0])))
-        return idx
+    def build(self, function_ir: FunctionIR, source_lines: List[str]) -> ControlFlowGraph:
+        start = function_ir.line
+        end = function_ir.end_line
 
-    def edge(self, source: int, target: int, kind: str = "normal") -> None:
-        if source != target and CFGEdge(source, target, kind) not in self.edges:
-            self.edges.append(CFGEdge(source, target, kind))
+        # -- collect every line where control flow may split ----------------
+        breakpoints: Set[int] = {start}
+        for cond in function_ir.conditionals:
+            breakpoints.add(int(cond["line"]))
+        for loop in function_ir.loops:
+            breakpoints.add(int(loop["line"]))
+        for exc in function_ir.exceptions:
+            breakpoints.add(int(exc["line"]))
 
+        return_lines: Set[int] = set()
+        for idx in range(start - 1, min(end, len(source_lines))):
+            if source_lines[idx].strip().startswith("return"):
+                lineno = idx + 1
+                breakpoints.add(lineno)
+                return_lines.add(lineno)
 
-def build_function_cfg(node: ast.FunctionDef) -> FunctionCFG:
-    """Build a conservative CFG for one Python function."""
-    b = _Builder()
-    entry = b.block([])
-    cfg = FunctionCFG(node.name, b.blocks, b.edges, entry=entry)
+        sorted_bp = sorted(b for b in breakpoints if b > 0)
 
-    def sequence(stmts: List[ast.stmt], incoming: List[int]) -> List[int]:
-        current = incoming[:]
-        for stmt in stmts:
-            if isinstance(stmt, ast.If):
-                cond = b.block([stmt])
-                for src in current:
-                    b.edge(src, cond)
-                then_out = sequence(stmt.body, [cond])
-                else_out = sequence(stmt.orelse, [cond]) if stmt.orelse else [cond]
-                if stmt.orelse:
-                    b.edge(cond, else_out[0], "false")
+        # -- split the function into contiguous blocks ----------------------
+        blocks: List[BasicBlock] = []
+        for i, bp in enumerate(sorted_bp):
+            bstart = bp
+            bend = sorted_bp[i + 1] - 1 if i + 1 < len(sorted_bp) else end
+            statements: List[str] = []
+            for lineno in range(bstart, bend + 1):
+                if 1 <= lineno <= len(source_lines):
+                    statements.append(source_lines[lineno - 1].rstrip())
+            blocks.append(BasicBlock(
+                id=i,
+                start_line=bstart,
+                end_line=bend,
+                statements=statements,
+            ))
+
+        def block_containing(line: int) -> int:
+            bidx = 0
+            for i, bp in enumerate(sorted_bp):
+                if bp <= line:
+                    bidx = i
                 else:
-                    b.edge(cond, cond, "false") if False else None
-                if then_out:
-                    b.edge(cond, then_out[0], "true")
-                current = then_out + else_out
-            elif isinstance(stmt, (ast.For, ast.While)):
-                head = b.block([stmt])
-                for src in current:
-                    b.edge(src, head)
-                body_out = sequence(stmt.body, [head])
-                for src in body_out:
-                    b.edge(src, head, "loop")
-                current = body_out + ([sequence(stmt.orelse, [head])[0]] if stmt.orelse else [head])
-            elif isinstance(stmt, ast.Try):
-                head = b.block([stmt])
-                for src in current:
-                    b.edge(src, head)
-                body_out = sequence(stmt.body, [head])
-                handler_out: List[int] = []
-                for handler in stmt.handlers:
-                    handler_out.extend(sequence(handler.body, [head]))
-                current = body_out + handler_out
-                if stmt.finalbody:
-                    current = sequence(stmt.finalbody, current)
-                elif stmt.orelse:
-                    current = sequence(stmt.orelse, current)
-            else:
-                blk = b.block([stmt])
-                for src in current:
-                    b.edge(src, blk)
-                if isinstance(stmt, (ast.Return, ast.Raise)):
-                    cfg.exits.add(blk)
-                    current = []
-                elif isinstance(stmt, (ast.Break, ast.Continue)):
-                    cfg.exits.add(blk)
-                    current = []
-                else:
-                    current = [blk]
-        return current
+                    break
+            return bidx
 
-    tail = sequence(node.body, [entry])
-    cfg.blocks = b.blocks
-    cfg.edges = b.edges
-    cfg.exits.update(tail)
-    if not node.body:
-        cfg.exits.add(entry)
-    return cfg
+        # -- terminal blocks: a return ends the block's fall-through --------
+        terminal: Set[int] = set()
+        for blk in blocks:
+            for lineno in range(blk.start_line, blk.end_line + 1):
+                if lineno in return_lines:
+                    terminal.add(blk.id)
+                    break
+
+        # -- linear fall-through edges --------------------------------------
+        for i in range(len(blocks) - 1):
+            if i in terminal:
+                continue
+            blocks[i].successors.append(i + 1)
+            blocks[i + 1].predecessors.append(i)
+
+        # -- conditional branch: decision block also skips to the join ------
+        for cond in function_ir.conditionals:
+            b = block_containing(int(cond["line"]))
+            if b + 2 < len(blocks) and (b + 2) not in blocks[b].successors:
+                blocks[b].successors.append(b + 2)
+                blocks[b + 2].predecessors.append(b)
+
+        # -- loop: back edge from the body block back to the loop header -----
+        for loop in function_ir.loops:
+            b = block_containing(int(loop["line"]))
+            if b + 1 < len(blocks):
+                blocks[b + 1].successors.append(b)
+                blocks[b].predecessors.append(b + 1)
+
+        # -- try/except: try block also branches to the except handler ------
+        for exc in function_ir.exceptions:
+            b = block_containing(int(exc["line"]))
+            if b + 2 < len(blocks) and (b + 2) not in blocks[b].successors:
+                blocks[b].successors.append(b + 2)
+                blocks[b + 2].predecessors.append(b)
+
+        return ControlFlowGraph(
+            blocks=blocks,
+            entry_block=0,
+            function_name=function_ir.name,
+        )
 
 
-def build_python_cfgs(path) -> List[FunctionCFG]:
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=str(path))
-    except (OSError, SyntaxError):
-        return []
-    return [build_function_cfg(node) for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+def reachable_blocks(cfg: ControlFlowGraph, start: int) -> Set[int]:
+    """Return the set of block ids reachable from ``start``."""
+    seen: Set[int] = set()
+    if not cfg.blocks:
+        return seen
+    stack: List[int] = [start]
+    while stack:
+        node = stack.pop()
+        if node in seen or not (0 <= node < len(cfg.blocks)):
+            continue
+        seen.add(node)
+        for succ in cfg.blocks[node].successors:
+            if succ not in seen:
+                stack.append(succ)
+    return seen
+
+
+def has_security_check_in_path(cfg: ControlFlowGraph, check_pattern: str) -> bool:
+    """Check whether any reachable block from the entry contains ``check_pattern``.
+
+    Used as counter-evidence: if a security check (e.g. ``is_admin``) appears
+    on every path to a sink, the finding can be downgraded.
+    """
+    if not cfg.blocks:
+        return False
+    reachable = reachable_blocks(cfg, cfg.entry_block)
+    for bid in reachable:
+        for stmt in cfg.blocks[bid].statements:
+            if check_pattern in stmt:
+                return True
+    return False
