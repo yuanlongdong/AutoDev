@@ -501,6 +501,21 @@ class XSSDetector(StructuredDetector):
     _ASSIGN = re.compile(r"^([A-Za-z_]\w*)\s*=\s*(.+)$")
     # identifiers in an expression
     _IDENTS = re.compile(r"\b[A-Za-z_]\w*\b")
+    # v0.4.4 – HTML-tag presence check for the two-step detector.  Unlike
+    # ``_FSTRING_HTML`` this deliberately does NOT forbid quoted characters, so
+    # it can see through single-quoted HTML attributes such as
+    # ``f"<div class='message'>{msg}</div>"`` (the v0.4.3 miss on
+    # django-target1 ``format_message``).
+    _HTML_TAG = re.compile(
+        r"<(?:h[1-6]|div|p|span|a|script|img|input|button|li|"
+        r"td|tr|table|form|select|option|br|hr|ul|ol|html|body)\b",
+        re.I,
+    )
+    # HTML / JSON response sinks that render a returned variable as a body.
+    _RESPONSE_SINKS = {
+        "HttpResponse", "JsonResponse", "StreamingHttpResponse",
+        "jsonify", "make_response", "Response", "HTMLResponse",
+    }
 
     # ------------------------------------------------------------------
     # taint model
@@ -601,6 +616,22 @@ class XSSDetector(StructuredDetector):
             return False
         return True  # uncertain → report
 
+    @staticmethod
+    def _fstring_assign_line(fn, source_lines: List[str], lhs: str):
+        """Locate the 1-indexed line where ``lhs = f"..."`` is assigned.
+
+        ``assignment_exprs`` carry no line numbers, so we scan the function
+        body for the assignment-to-f-string line.  ``None`` is returned when no
+        such line exists (e.g. the assignment spans multiple lines).
+        """
+        pat = re.compile(r"^\s*" + re.escape(lhs) + r"\s*=\s*f['\"]")
+        lo = max(0, fn.line - 1)
+        hi = min(len(source_lines), fn.end_line)
+        for idx in range(lo, hi):
+            if pat.match(source_lines[idx]):
+                return idx + 1
+        return None
+
     # ------------------------------------------------------------------
     # detection
     # ------------------------------------------------------------------
@@ -654,6 +685,53 @@ class XSSDetector(StructuredDetector):
                     "Return data rather than HTML, or escape interpolated values with markupsafe.escape.",
                     fn.name,
                 ))
+
+        # 3. v0.4.4 – two-step pattern:
+        #   html_var = f"<html...{tainted_root}...>"   (an f-string *assigned
+        #   to a local variable* — including ones whose HTML attributes use
+        #   single quotes, which step 2's line regex cannot see through) then
+        #   the variable reaches a response sink:
+        #   ``return HttpResponse(html_var)`` / ``return html_var`` /
+        #   ``return jsonify(html_var)``.  The shared taint gate still applies:
+        #   only tainted (or left-uncertain) interpolated roots are reported;
+        #   static HTML literals and database/hash/subprocess output are not.
+        reported_lines = {v.line for v in out}
+
+        returned_vars: set = set()
+        for r in fn.returns:
+            returned_vars |= self._idents(r)
+        for call in fn.calls:
+            if call.name.split(".")[-1] in self._RESPONSE_SINKS:
+                for arg in call.args:
+                    returned_vars.add(arg.strip().split(".")[0])
+
+        for expr in fn.assignment_exprs:
+            m = self._ASSIGN.match(expr.strip())
+            if not m:
+                continue
+            lhs, rhs = m.group(1), m.group(2)
+            if not _is_fstring(rhs):
+                continue
+            # must build HTML (a tag) AND interpolate something
+            if "{" not in rhs or not self._HTML_TAG.search(rhs):
+                continue
+            # the assigned variable must actually reach a response sink
+            if lhs not in returned_vars:
+                continue
+            # taint gate on the interpolated roots
+            if not self._line_references_tainted(rhs, tainted, safe):
+                continue
+            line_no = self._fstring_assign_line(fn, source_lines, lhs)
+            if line_no is None or line_no in reported_lines:
+                continue
+            reported_lines.add(line_no)
+            out.append(_build_vuln(
+                self.category, fn.path, line_no,
+                rhs.strip(), "browser",
+                f"Dynamic HTML built via f-string interpolation and returned as a response in '{fn.name}'",
+                "Return data rather than HTML, or escape interpolated values with markupsafe.escape.",
+                fn.name,
+            ))
         return out
 
 
@@ -1963,6 +2041,16 @@ class CodeInjectionDetector(StructuredDetector):
                 reason = f"{base}() fed a request expression in '{fn.name}'"
             elif _is_fstring(first) or _has_concat(first):
                 reason = f"{base}() called on a dynamically-built string in '{fn.name}'"
+            elif first.strip().startswith("self."):
+                # v0.4.3 – second-order code execution: ``self.<attr>`` reads a
+                # value persisted in the database / model state, which an
+                # attacker may have written earlier (e.g. Django ``TextField``
+                # ``self.expression``).  No intra-procedural source tracking is
+                # needed: any model attribute reaching eval/exec/compile is
+                # unsafe to execute.
+                reason = (f"{base}() called on '{first.strip()}', a model/instance "
+                          f"attribute that may hold attacker-controlled persisted data "
+                          f"(second-order code execution) in '{fn.name}'")
             elif _is_variable(first):
                 root = first.strip().split(".")[0]
                 if root in tainted:
@@ -2228,10 +2316,15 @@ class SSLVerificationDisablerDetector(StructuredDetector):
     _UNVERIFIED_CTX = re.compile(r"_create_unverified_context|create_unverified_context", re.I)
     _DISABLE_WARN = re.compile(r"urllib3\.disable_warnings|disable_warnings\s*\(", re.I)
     _CHECK_HOSTNAME = re.compile(r"check_hostname\s*=\s*False|verify_mode\s*=\s*\w*CERT_NONE", re.I)
+    # v0.4.3 – SSH equivalent of disabling certificate validation:
+    # ``client.set_missing_host_key_policy(paramiko.AutoAddPolicy())`` blindly
+    # trusts any server key presented on first use.
+    _AUTO_ADD_POLICY = re.compile(r"AutoAddPolicy", re.I)
 
     def detect(self, fn, source_lines, project_ir):
         out = []
         seen = set()
+        auto_policy_lines: dict = {}
         for call in fn.calls:
             joined = " ".join(call.args)
             name = call.name
@@ -2243,6 +2336,13 @@ class SSLVerificationDisablerDetector(StructuredDetector):
                 hit = name
             elif self._DISABLE_WARN.search(name):
                 hit = name
+            elif self._AUTO_ADD_POLICY.search(name) or self._AUTO_ADD_POLICY.search(joined):
+                # Inner call ``paramiko.AutoAddPolicy()`` and the outer
+                # ``set_missing_host_key_policy(...)`` share a line: report once.
+                auto_policy_lines.setdefault(
+                    call.line,
+                    "paramiko.AutoAddPolicy() — SSH host key is auto-accepted",
+                )
             if hit and (call.line, hit) not in seen:
                 seen.add((call.line, hit))
                 out.append(_build_vuln(
@@ -2252,6 +2352,19 @@ class SSLVerificationDisablerDetector(StructuredDetector):
                     "Do not disable TLS verification; pin / verify certificates in production.",
                     fn.name,
                 ))
+        for line, snippet in sorted(auto_policy_lines.items()):
+            if line in seen:
+                continue
+            seen.add(line)
+            out.append(_build_vuln(
+                self.category, fn.path, line,
+                snippet, "network",
+                f"SSH host-key verification disabled via '{snippet}' in '{fn.name}' "
+                f"(equivalent of disabling certificate validation)",
+                "Use RejectPolicy()/WarningPolicy() and pin known host keys; never "
+                "blindly accept unknown SSH hosts.",
+                fn.name,
+            ))
         # assignment-based disabling: ``context.check_hostname = False`` etc.
         for lineno, line in enumerate(source_lines, 1):
             if not (fn.line <= lineno <= fn.end_line) or lineno in seen:
@@ -2505,6 +2618,183 @@ class ZipSlipDetector(StructuredDetector):
 
 
 # ---------------------------------------------------------------------------
+# 38. Email Header Injection (v0.4.3)
+# ---------------------------------------------------------------------------
+
+
+class EmailHeaderInjectionDetector(StructuredDetector):
+    """v0.4.3 – flag SMTP bodies that interpolate attacker-controlled values
+    directly into mail headers (``To`` / ``From`` / ``Subject`` / ``Cc`` /
+    ``Bcc``), allowing CRLF header / content injection (CWE-640).
+
+    A function is in scope when it performs a ``*.sendmail(...)`` call (or
+    builds a message via ``smtplib.SMTP``).  The third argument of
+    ``sendmail`` — the raw message — is traced back to its assignment; when
+    that value is an f-string which (a) contains at least one header token
+    (``To:``/``From:``/``Subject:``/``Cc:``/``Bcc:``) and (b) interpolates at
+    least one ``{...}`` expression, the finding is reported.
+
+    A fully static, non-interpolated message body is never reported.
+    """
+
+    category = "email-header-injection"
+    _SENDMAIL = re.compile(r"sendmail$", re.I)
+    _SMTP_CTX = re.compile(r"smtplib\.SMTP|smtplib$", re.I)
+    _HEADER = re.compile(r"(?:To|From|Subject|Cc|Bcc)\s*:", re.I)
+    _ASSIGN = re.compile(r"^([A-Za-z_]\w*)\s*=\s*(.+)$")
+
+    @staticmethod
+    def _is_fstr(text: str) -> bool:
+        t = text.strip()
+        return t.startswith(("f'", 'f"', "F'", 'F"'))
+    def detect(self, fn, source_lines, project_ir):
+        # Build lhs -> rhs assignment map for cheap variable tracing.
+        assigns: dict = {}
+        for expr in fn.assignment_exprs:
+            m = self._ASSIGN.match(expr.strip())
+            if m:
+                assigns.setdefault(m.group(1), m.group(2).strip())
+
+        # Collect candidate message strings: either the third positional arg of
+        # a sendmail call itself, or a variable assigned an f-string.
+        out = []
+        has_smtp = False
+        for call in fn.calls:
+            if self._SENDMAIL.search(call.name):
+                has_smtp = True
+                msg_expr = call.args[2] if len(call.args) >= 3 else ""
+                candidates = [msg_expr]
+                # trace a bare variable back to its f-string assignment
+                root = msg_expr.strip()
+                if root in assigns:
+                    candidates.append(assigns[root])
+                for cand in candidates:
+                    if self._is_fstr(cand) and self._HEADER.search(cand) and "{" in cand:
+                        out.append(_build_vuln(
+                            self.category, fn.path, call.line,
+                            f"{call.name}(...) with interpolated headers",
+                            "smtp",
+                            f"Mail message for '{call.name}' interpolates "
+                            f"user-controlled values into To/From/Subject headers in "
+                            f"'{fn.name}' (CRLF / header injection)",
+                            "Validate and sanitize recipient/subject values; use an SMTP "
+                            "library that encodes headers (e.g. email.message.EmailMessage)",
+                            fn.name,
+                        ))
+                        break
+            elif self._SMTP_CTX.search(call.name):
+                has_smtp = True
+
+        # Simplified fallback: an smtplib-based helper that builds a header
+        # f-string even when the sendmail call's 3rd arg is not directly
+        # traced (defensive; covers EmailMessage / send_mail shapes).
+        if not out and has_smtp:
+            for lhs, rhs in assigns.items():
+                if self._is_fstr(rhs) and self._HEADER.search(rhs) and "{" in rhs:
+                    out.append(_build_vuln(
+                        self.category, fn.path, fn.line,
+                        f"{lhs} = <interpolated mail headers>", "smtp",
+                        f"Mail body '{lhs}' is built from an f-string containing "
+                        f"To/From/Subject headers with variable interpolation in "
+                        f"'{fn.name}' (header injection)",
+                        "Sanitize header values against CRLF; use a proper MIME library.",
+                        fn.name,
+                    ))
+                    break
+        return out
+
+
+# ---------------------------------------------------------------------------
+# 39. Insecure Temporary File (v0.4.3)
+# ---------------------------------------------------------------------------
+
+
+class InsecureTempFileDetector(StructuredDetector):
+    """v0.4.3 – flag predictable temporary filenames under ``/tmp`` and
+    world-writable temporary files (CWE-377 / CWE-732).
+
+    Reports two shapes:
+
+    * **Predictable path** – ``open(...)`` writes to a path whose value is an
+      f-string under ``/tmp/`` interpolating predictable values (``os.getpid()``,
+      timestamps / ``now()``, counters), which enables symlink / race attacks.
+    * **World-writable mode** – ``os.chmod(path, 0o777)`` / ``0o666``.
+
+    The safe APIs ``tempfile.mkstemp`` / ``tempfile.NamedTemporaryFile`` /
+    ``tempfile.mkdtemp`` are not flagged.
+    """
+
+    category = "insecure-temp-file"
+    _ASSIGN = re.compile(r"^([A-Za-z_]\w*)\s*=\s*(.+)$")
+    _PREDICTABLE = re.compile(
+        r"getpid|timestamp|now\s*\(\)|time\s*\(\)|counter|str\s*\(\s*os\.",
+        re.I,
+    )
+    _SAFE_TMP = re.compile(r"mkstemp|NamedTemporaryFile|mkdtemp|mktemp", re.I)
+    # 0o777 == 511, 0o666 == 438 after ast.unparse; also accept literal octal.
+    _WORLD_MODES = re.compile(r"^(?:0o(?:777|666)|511|438)$")
+
+    def detect(self, fn, source_lines, project_ir):
+        # Safe temp APIs present → the function already uses a secure path.
+        uses_safe_tmp = any(
+            self._SAFE_TMP.search(c.name) for c in fn.calls
+        )
+
+        assigns: dict = {}
+        for expr in fn.assignment_exprs:
+            m = self._ASSIGN.match(expr.strip())
+            if m:
+                assigns.setdefault(m.group(1), m.group(2).strip())
+
+        out = []
+        seen_lines = set()
+
+        for call in fn.calls:
+            base = call.name.split(".")[-1]
+
+            # Rule A: open(<predictable /tmp path>, ...)
+            if base == "open" and call.args:
+                path_arg = call.args[0].strip()
+                candidate = path_arg
+                root = path_arg.strip().strip("'\"")
+                if root in assigns:
+                    candidate = assigns[root]
+                is_fstr = candidate.startswith(("f'", 'f"', "F'", 'F"'))
+                if (is_fstr and not uses_safe_tmp
+                        and "/tmp/" in candidate
+                        and "{" in candidate
+                        and self._PREDICTABLE.search(candidate)):
+                    if call.line not in seen_lines:
+                        seen_lines.add(call.line)
+                        out.append(_build_vuln(
+                            self.category, fn.path, call.line,
+                            candidate[:80], "filesystem",
+                            f"Temporary file at a predictable /tmp path is opened for "
+                            f"writing in '{fn.name}' (symlink / race condition)",
+                            "Use tempfile.mkstemp() / tempfile.NamedTemporaryFile() which "
+                            "create unpredictable, mode-0600 files atomically.",
+                            fn.name,
+                        ))
+
+            # Rule B: os.chmod(path, 0o777 / 0o666)
+            if base == "chmod":
+                for arg in call.args[1:]:
+                    if self._WORLD_MODES.match(arg.strip()):
+                        if call.line not in seen_lines:
+                            seen_lines.add(call.line)
+                            out.append(_build_vuln(
+                                self.category, fn.path, call.line,
+                                f"os.chmod(..., {arg.strip()})", "filesystem",
+                                f"Temporary/shared file is made world-accessible "
+                                f"(mode {arg.strip()}) in '{fn.name}'",
+                                "Restrict file permissions (0600/0640); never 0777/0666.",
+                                fn.name,
+                            ))
+                        break
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -2556,6 +2846,9 @@ class DetectorPipeline:
             CORSMisconfigurationDetector(),
             InsecureCookieDetector(),
             ZipSlipDetector(),
+            # v0.4.3 – round-8 shooting-range fixes
+            EmailHeaderInjectionDetector(),
+            InsecureTempFileDetector(),
         ]
 
     def run(self, function_ir: FunctionIR, source_lines: List[str], project_ir: ProjectIR) -> List[Vulnerability]:

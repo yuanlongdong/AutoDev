@@ -532,3 +532,93 @@ AutoDev/
 - 新增 `tests/test_round7_fixes.py` 共 12 个用例：用户可控 origin 检测、静态 origin 不报、通配+凭证检测、Flask-CORS 通配检测、httponly/secure 缺陷检测、安全 flag 不报、extractall 检测、带路径校验不报、request.POST eval/exec 检测、request.GET eval 检测，以及扫描 django-target1（code-injection≥2）、sast-target（cors-misconfiguration/insecure-cookie≥1）的集成测试。
 - 版本号 `0.4.1 → 0.4.2`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
 - 原有 261 个测试全部通过；新增 12 个，总计 273 个测试通过。
+
+## 16. v0.4.3 第八轮靶场修复
+
+第八轮靶场回归发现 4 类漏报，本轮全部补齐。
+
+### 16.1 漏报根因与修复
+
+1. **Email Header Injection**（django-target1 api.py L157-178）：新增 `EmailHeaderInjectionDetector`。
+   - 检测 `*.sendmail(...)` 调用，将第三个参数（原始邮件体）回溯到其 f-string 赋值；
+   - 当该 f-string 同时包含 `To:`/`From:`/`Subject:`/`Cc:`/`Bcc:` 头与至少一处 `{...}` 插值时报告（CRLF / 头注入）；
+   - 附带简化兜底：函数使用 `smtplib.SMTP` 且存在含头+插值的 f-string 时亦报告；
+   - 完全静态、无插值的邮件体不报告。category=`email-header-injection`，severity=`Medium`，CWE-640。
+
+2. **CodeInjectionDetector 不识别 `self.<attr>`**（django-target1 models.py L216、L220）：
+   - 根因为 `_TAINT_SRC` 只识别 `request.*` 与路由参数，未识别 Django Model 中从数据库读取的 `self.expression` 等持久化属性；
+   - 在 `eval/exec/compile` 首个参数为 `self.<attr>` 开头时直接报告，视为二阶代码执行（存储数据可被攻击者预先写入）；
+   - 静态字符串字面量参数（`eval("1+1")`）仍不报告。
+
+3. **SSH AutoAddPolicy**（django-target1 api.py L114-120）：扩展 `SSLVerificationDisablerDetector`。
+   - 检测 `set_missing_host_key_policy(paramiko.AutoAddPolicy())` 及裸 `paramiko.AutoAddPolicy()` 调用；
+   - 归入既有 `ssl-verification-disabled` 类别（同为禁用传输层安全验证），evidence 说明这是 SSH host key 自动接受；
+   - 同一行的内层 `AutoAddPolicy()` 与外层 `set_missing_host_key_policy(...)` 去重为一条；`RejectPolicy()` 不报告。
+
+4. **不安全临时文件**（django-target1 models.py L242-255）：新增 `InsecureTempFileDetector`。
+   - 规则 a：`open(...)` 写入路径回溯为 `/tmp/` 下含 `{...}` 插值的 f-string，且插值含可预测值（`getpid`/`timestamp`/`now()`/`time()`/`str(os...)` 等）→ 报告（symlink race）；
+   - 规则 b：`os.chmod(path, 0o777)` / `0o666`（经 `ast.unparse` 归一化为 `511`/`438`）→ 报告（全局可写）；
+   - 使用 `tempfile.mkstemp()` / `NamedTemporaryFile()` / `mkdtemp()` 的安全 API 不报告。category=`insecure-temp-file`，severity=`Low`，CWE-377。
+
+### 16.2 knowledge_base 新增类别
+
+- `email-header-injection`：title "Email Header Injection"，group `web-api`，default `Medium`，CWE-640。
+- `insecure-temp-file`：title "Insecure Temporary File"，group `web-api`，default `Low`，CWE-377。
+- SSH 问题归入既有 `ssl-verification-disabled` 类别，未新增类别。
+
+两个新检测器（`EmailHeaderInjectionDetector`、`InsecureTempFileDetector`）均已注册进 `DetectorPipeline`。
+
+### 16.3 靶场复验结果
+
+- **django-target1**：`email-header-injection` 0 → 1（send_email L167）；`code-injection` 2 → 4（新增 models.py `evaluate` L216 + `execute` L220）；`ssl-verification-disabled` 3 → 4（新增 `connect_ssh_insecure` L118 SSH AutoAddPolicy）；`insecure-temp-file` ≥1（`create_temp_file` L243 + `create_shared_temp` L253 chmod，另含 views.py `process_upload` L327）。
+- **sast-target**：总数 48 不变，无下降、无新增误报。
+- **app_remediated.py**：0 个发现（零新增误报）。
+
+### 16.4 测试与版本
+
+- 新增 fixtures（`tests/fixtures/round8/`）：`email_injection.py`、`model_eval.py`、`ssh_autoadd.py`、`insecure_temp.py`。
+- 新增 `tests/test_round8_fixes.py` 共 10 个用例：邮件头注入检测、无用户输入不报告、`self.*` eval/exec/compile 检测、静态字面量不报告、AutoAddPolicy 检测、RejectPolicy 不报告、可预测 /tmp 路径检测、chmod 0o777 检测、`mkstemp` 不报告，以及扫描 django-target1 的集成测试。
+- 版本号 `0.4.2 → 0.4.3`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
+- 原有 273 个测试全部通过；新增 10 个，总计 283 个测试通过。
+
+## 17. v0.4.4 第九轮靶场修复
+
+### 17.1 漏报：XSS 两步模式（变量赋值 + HttpResponse 返回）
+
+第九轮靶场在 `django-target1/views.py` L121-126 的 `format_message` 发现一处 XSS 漏报：
+
+```python
+def format_message(request):
+    message = request.GET.get('msg', '')
+    html = f"<div class='message'>{message}</div>"   # f-string HTML 赋值给变量
+    return HttpResponse(html)                        # 变量再被返回
+```
+
+v0.4.3 的 `XSSDetector` 只在「返回语句所在行」检测 `return f"<html>{var}</html>"` 的直接模式，漏掉了「先把 HTML f-string 赋值给变量、再返回该变量」的两步写法。根因有二：
+
+1. 旧的逐行 `_FSTRING_HTML` 正则用 `[^'\"]*` 同时禁止单/双引号，无法看穿双引号 f-string 里的单引号 HTML 属性（`class='message'`），因此 L125 整行都匹配不上；
+2. 检测器没有「赋值给变量 → 该变量流入响应 sink」这一跨语句关联。
+
+### 17.2 XSSDetector 新增两步检测（AST 级，非执行）
+
+在 `detect()` 末尾新增第三步，完全基于已有的 `FunctionIR`（`assignment_exprs` / `calls` / `returns`），不执行被分析代码：
+
+- 扫描函数体赋值语句 `lhs = rhs`，要求 `rhs` 本身是 f-string（`_is_fstring`）、含 HTML 标签（新增 `_HTML_TAG`，不再禁止引号，可看穿 `class='...'`）且含 `{...}` 插值；
+- 复用既有污点门 `_line_references_tainted()`：仅当插值根变量来自 `request.*` / `session.*` / 路由参数（tainted）时报告；数据库、哈希/编码、subprocess 输出（safe）与不确定来源按既有策略处理；
+- 新增「返回门」：收集所有返回表达式里的标识符，以及 `HttpResponse` / `JsonResponse` / `jsonify` / `make_response` / `Response` / `HTMLResponse` 等响应 sink 调用的入参根变量，要求被赋值的 `lhs` 确实流入响应（`return HttpResponse(var)`、`return var`、`return jsonify(var)`）才报告；
+- 通过新增 `_fstring_assign_line()` 在函数体内定位 `lhs = f"..."` 的真实行号，并与前两步已报告行按行去重，避免与既有直接模式重复计数；
+- 既有的直接 `return f"<html>"`、`render_template_string(污点变量)`、`Markup/mark_safe` 模式与全部污点追踪逻辑保持不变。
+
+### 17.3 靶场复验结果
+
+- **django-target1**：XSS 2 → 3（新增 L125 `format_message`），原有 L109 `greet_user`、L117 `render_profile` 保留。
+- **sast-target**：XSS 保持 3（L501、L516、L545），不下降、无新增。
+- **app_remediated.py**：XSS 0（零新增误报；其 f-string 均为内联 `jsonify({...})`，不存在「赋值给变量再返回」的两步结构）。
+
+### 17.4 测试与版本
+
+- 新增 fixtures（`tests/fixtures/round9/`）：`xss_two_step.py`（`html = f"<div class='message'>{user_input}</div>"; return HttpResponse(html)`，应报告；另含裸 `return html` 变体）、`xss_two_step_safe.py`（DB 输出，不报告）、`xss_two_step_static.py`（静态 HTML 字面量，不报告）。
+- 新增 `tests/test_round9_xss.py` 共 5 个用例：两步检测、报告位于赋值行、DB 输出不报告、静态 HTML 不报告，以及扫描 django-target1 确认 XSS ≥3 的集成测试。
+- 版本号 `0.4.3 → 0.4.4`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
+- 原有 283 个测试全部通过；新增 5 个，总计 288 个测试通过。
+
