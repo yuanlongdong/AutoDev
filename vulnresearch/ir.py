@@ -59,6 +59,11 @@ class FunctionIR:
     # backward compatibility so old hand-built FunctionIR objects keep working.
     # Module-level imports still live on ``ProjectIR.imports``.
     imports: List[str] = field(default_factory=list)
+    # v0.7.0: set to ``"tornado"`` (or another framework tag) when this function
+    # is an HTTP route handler discovered through class inheritance rather than a
+    # decorator — e.g. ``def get(self)`` / ``def post(self)`` on a
+    # ``tornado.web.RequestHandler`` subclass.  Defaulted for back-compat.
+    route_kind: str = ""
 
 
 @dataclass
@@ -95,6 +100,10 @@ def _call_name(node: ast.Call) -> str:
 
 PY_SOURCE_PATTERNS = re.compile(
     r"(?:request\.(?:args|form|json|values|data|query_params|get|post|body|files|cookies|headers)|"
+    # v0.7.0 – Bottle / Tornado request sources
+    r"request\.(?:query|forms|params|environ)\.get|"
+    r"self\.get_argument|"
+    r"self\.request\.(?:files|body|arguments)|"
     r"sys\.argv|input\s*\(|os\.environ)", re.I
 )
 PY_SINK_NAMES = {
@@ -115,6 +124,12 @@ class _PythonExtractor(ast.NodeVisitor):
         self.current_class: str = ""
         self.imports: List[str] = []
         self.classes: List[dict] = []
+        # v0.7.0: names of classes that inherit from a *RequestHandler*-style
+        # base (tornado.web.RequestHandler, aiohttp View, ...).  Their
+        # ``get``/``post``/... methods are route handlers even though they carry
+        # no ``@app.route`` decorator.
+        self._handler_class_names: set = set()
+        self._http_methods = {"get", "post", "put", "delete", "patch", "head", "options"}
 
     # -- function / method handling ----------------------------------------
 
@@ -147,6 +162,10 @@ class _PythonExtractor(ast.NodeVisitor):
             decorators=decorators,
             class_name=self.current_class,
         )
+        # v0.7.0: a ``get``/``post``/... method on a RequestHandler subclass is
+        # a route handler even without an ``@app.route`` decorator.
+        if self.current_class in self._handler_class_names and node.name in self._http_methods:
+            fn.route_kind = "tornado"
         self.functions.append(fn)
         self._stack.append(fn)
         for child in node.body:
@@ -173,6 +192,10 @@ class _PythonExtractor(ast.NodeVisitor):
             "methods": methods,
             "bases": bases,
         })
+        # v0.7.0: register RequestHandler-style bases so their HTTP methods are
+        # recognised as route handlers downstream.
+        if any("RequestHandler" in b for b in bases):
+            self._handler_class_names.add(node.name)
         prev_class = self.current_class
         self.current_class = node.name
         for child in node.body:
@@ -306,13 +329,50 @@ class _PythonExtractor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+# v0.7.0 – Python 2 ``print "..."`` statement → ``print(...)`` function call.
+# Matches a line whose first token (after indentation) is ``print`` followed by
+# whitespace and *not* an opening paren (so ``print(x)`` is left alone).  Comment
+# lines (``#print ...``) never match because of the leading ``^[ \t]*print``.
+_PY2_PRINT_RE = re.compile(r"^([ \t]*)print[ \t]+(?!\()(.*?)\s*$")
+
+
+def _py2_print_to_call(text: str) -> str:
+    """In-memory, line-by-line Python 2 ``print``-statement transform.
+
+    Only the single most common Python 2-only construct is converted
+    (``print "..."`` / ``print expr`` → ``print(...)``).  Nothing else is
+    rewritten, the original file is never touched, and line numbers are
+    preserved (one line in → one line out) so detector line references still
+    line up.  If the converted source still does not parse the caller falls back
+    to the legacy regex layer.
+    """
+    out: List[str] = []
+    for line in text.splitlines():
+        m = _PY2_PRINT_RE.match(line)
+        if not m:
+            out.append(line)
+            continue
+        out.append(f"{m.group(1)}print({m.group(2)})")
+    return "\n".join(out)
+
+
 def extract_python(path: Path) -> ProjectIR:
     """Parse a single Python file into a :class:`ProjectIR`."""
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(text, filename=str(path))
-    except (OSError, SyntaxError):
+    except OSError:
         return ProjectIR()
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        # v0.7.0: tolerate Python 2 ``print`` statements (e.g. the vulnerable
+        # Tornado lab).  Apply a tiny in-memory print→print() transform and
+        # retry; only the structured IR path is affected, the on-disk file and
+        # the legacy regex scan are unchanged.
+        try:
+            tree = ast.parse(_py2_print_to_call(text), filename=str(path))
+        except SyntaxError:
+            return ProjectIR()
     visitor = _PythonExtractor(str(path))
     visitor.visit(tree)
     return ProjectIR(

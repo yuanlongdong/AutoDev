@@ -244,7 +244,11 @@ _ROUTE_DECO_RE = re.compile(
 _REQUEST_SRC_RE = re.compile(
     r"request\.(?:args|form|json|values|data|body|cookies|headers|"
     r"query_params|view_args|files|POST|GET)\b"
-    r"|request\s*\[\s*['\"]",
+    r"|request\s*\[\s*['\"]"
+    # v0.7.0 – Bottle / Tornado request sources
+    r"|request\.(?:query|forms|params|environ)\.get\s*\("
+    r"|self\.get_argument\s*\("
+    r"|self\.request\.(?:files|body|arguments)\b",
     re.I,
 )
 _ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][\w\.]*)\s*=\s*(.+)$")
@@ -257,10 +261,15 @@ def is_route_handler(fn: FunctionIR) -> bool:
     """True when *fn* is registered as an HTTP route handler.
 
     Recognises both ``@app.route(...)`` (Flask) and ``@app.get(...)`` /
-    ``@router.post(...)`` / ``@bp.put(...)`` (FastAPI / Starlette / Django).
+    ``@router.post(...)`` / ``@bp.put(...)`` (FastAPI / Starlette / Django),
+    and v0.7.0 Tornado / aiohttp-style handler methods (``def get(self)`` /
+    ``def post(self)``) on a ``tornado.web.RequestHandler`` subclass.
     """
     decos = list(getattr(fn, "decorators", []) or [])
-    return any(_ROUTE_DECO_RE.search(d) for d in decos)
+    if any(_ROUTE_DECO_RE.search(d) for d in decos):
+        return True
+    # v0.7.0: class-based HTTP handlers tagged by the IR extractor.
+    return bool(getattr(fn, "route_kind", ""))
 
 
 def route_handler_taints_params(fn: FunctionIR) -> bool:
@@ -740,7 +749,11 @@ class XSSDetector(StructuredDetector):
         r"request\.(?:args|form|json|values|data|body|cookies|headers|query_params|view_args|files|POST|GET)\b"
         r"|request\s*\[\s*['\"]"
         r"|session\s*\[\s*['\"]"
-        r"|session\.get\s*\(",
+        r"|session\.get\s*\("
+        # v0.7.0 – Bottle / Tornado request sources
+        r"|request\.(?:query|forms|params|environ)\.get\s*\("
+        r"|self\.get_argument\s*\("
+        r"|self\.request\.(?:files|body|arguments)\b",
         re.I,
     )
     # RHS expressions that are *provably safe* (not user-controlled HTML)
@@ -925,6 +938,27 @@ class XSSDetector(StructuredDetector):
                         "Render static templates with variables passed as context, never as template source.",
                         fn.name,
                     ))
+            elif base == "render" and call.name.split(".")[0] == "self":
+                # v0.7.0 – Tornado: ``self.render("tpl.html", var=user_input)``.
+                # Flag when a template *context* value flows directly from a
+                # request source into the rendered template.
+                for arg in call.args:
+                    km = self._ASSIGN.match(arg.strip())
+                    if not km:
+                        continue
+                    val = km.group(2).strip()
+                    if _is_string_literal(val) or _is_fstring(val):
+                        continue
+                    root = val.split(".")[0].split("[")[0]
+                    if root in tainted:
+                        out.append(_build_vuln(
+                            self.category, fn.path, call.line,
+                            arg.strip(), "browser",
+                            f"User-controlled value passed to self.render() template context in '{fn.name}'",
+                            "Escape user input before rendering, or rely on Tornado's automatic template escaping.",
+                            fn.name,
+                        ))
+                        break
 
         # 2. f-string HTML concatenation in the function body — gated by taint
         for lineno, line in enumerate(source_lines, 1):
@@ -1003,7 +1037,9 @@ class SSTIDetector(StructuredDetector):
     """
 
     category = "ssti"
-    _CALLS = {"render_template_string", "Template", "env.from_string", "from_string"}
+    _CALLS = {"render_template_string", "Template", "env.from_string", "from_string",
+              # v0.7.0 – Bottle ``template(source)`` helper
+              "template"}
     # Match ``varname = "..."`` or ``varname = '...'`` or ``varname = """..."""``
     # (static string assignments — safe templates).  The string literal must
     # span the entire RHS (no ``+`` concatenation after the closing quote).
@@ -1054,8 +1090,13 @@ class SSTIDetector(StructuredDetector):
             elif _is_variable(first) and fn.sources:
                 # If the variable was assigned a static string literal in the
                 # function body, it is a safe template — skip.
-                var_name = first.strip()
+                var_name = first.strip().split("[")[0].split(".")[0]
                 if var_name in static_vars:
+                    continue
+                # v0.7.0: a *parameter* that names a static template file
+                # (Bottle ``template(view, ...)`` where ``view`` is a route's
+                # template name) is not user-controlled template source.
+                if var_name in set(fn.parameters):
                     continue
                 out.append(_build_vuln(
                     self.category, fn.path, call.line,
@@ -1371,18 +1412,25 @@ class ArbitraryFileWriteDetector(StructuredDetector):
 # ---------------------------------------------------------------------------
 
 class FileUploadDetector(StructuredDetector):
-    """Detect request.files without secure_filename / extension checks."""
+    """Detect request.files without secure_filename / extension checks.
+
+    v0.7.0: also covers Tornado handlers that read ``self.request.files['..']``
+    and stream the body to disk via ``io.open(path, 'wb')`` (no ``.save()``
+    helper).
+    """
 
     category = "file-upload"
 
     def detect(self, fn, source_lines, project_ir):
         body = self.body_text(fn, source_lines).lower()
-        if "request.files" not in body and "file_storage" not in body:
+        if ("request.files" not in body and "self.request.files" not in body
+                and "file_storage" not in body):
             return []
         calls_str = " ".join(c.name for c in fn.calls)
         if "secure_filename" in calls_str:
             return []
         out = []
+        # Flask-style: ``file.save(path)``.
         for call in fn.calls:
             if call.name.split(".")[-1] == "save":
                 out.append(_build_vuln(
@@ -1393,6 +1441,21 @@ class FileUploadDetector(StructuredDetector):
                     fn.name,
                 ))
                 break
+        # v0.7.0 – Tornado-style: uploaded bytes written straight to disk with
+        # a write-mode open (``io.open(path, 'wb')`` / ``open(path, 'wb')``).
+        if not out and "self.request.files" in body and re.search(
+                r"\b(?:io\.open|open)\s*\([^)]*['\"]wb['\"]", body):
+            for call in fn.calls:
+                if call.name.split(".")[-1] == "open" and any(
+                        "'wb'" in a or '"wb"' in a for a in call.args):
+                    out.append(_build_vuln(
+                        self.category, fn.path, call.line,
+                        "self.request.files[...] written to disk", "filesystem",
+                        f"Upload written to disk without filename sanitisation / extension allowlist in '{fn.name}'",
+                        "Sanitize the uploaded filename and restrict extensions before writing.",
+                        fn.name,
+                    ))
+                    break
         return out
 
 
@@ -1462,30 +1525,55 @@ class OpenRedirectDetector(StructuredDetector):
 # ---------------------------------------------------------------------------
 
 class WeakCryptoDetector(StructuredDetector):
-    """Detect md5 / sha1 / DES / ECB usage."""
+    """Detect weak / misconfigured cryptography (v0.7.0 deepened).
+
+    Covers weak digests (md5 / sha1), legacy broken block ciphers
+    (DES / 3DES / RC4 / Blowfish), ECB mode, hard-coded IVs and disabled TLS
+    certificate verification.  Scans the whole file so module-level constants
+    (hard-coded IV / key) are reported too; the pipeline dedups by line.
+    """
 
     category = "weak-cryptography"
     _RE = re.compile(
-        r"\b(?:hashlib\.)?(?:md5|sha1)\s*\(|"
-        r"\.new\s*\(\s*['\"](?:md5|sha1)['\"]|"
-        r"\bDES\b|\bMODE_ECB\b|Crypto\.Cipher\.DES",
+        # weak digest algorithms
+        r"\b(?:hashlib\.)?(?:md5|sha1)\s*\(|\.new\s*\(\s*['\"](?:md5|sha1)['\"]"
+        # legacy / broken block ciphers
+        r"|\bDES\b|\bDES3\b|triple_?des|\bARC4\b|\bRC4\b|\bBlowfish\b"
+        r"|Crypto\.Cipher\.(?:DES|DES3|Blowfish|ARC|XOR)"
+        r"|algorithms\.(?:DES|TripleDES|Blowfish|ARC4|CAST)"
+        # ECB mode (no semantic security)
+        r"|\bMODE_ECB\b|modes\.ECB\s*\("
+        # hard-coded IV: ``iv=b'...'`` kwarg or ``AES_IV = b'...'`` constant
+        r"|(?<![A-Za-z0-9_])iv\s*=\s*b?['\"][^'\"]{8,}['\"]"
+        r"|\b[A-Za-z_][A-Za-z0-9_]*_?IV\s*=\s*b?['\"][^'\"]{8,}['\"]"
+        # disabled TLS verification at the ssl layer
+        r"|ssl\.CERT_NONE|_create_unverified_context\s*\(",
         re.IGNORECASE,
     )
 
     def detect(self, fn, source_lines, project_ir):
+        # v0.7.0: scan the whole file so module-level constants (hard-coded IV /
+        # key) are also reported, but cache the per-file matches so we do not
+        # re-run the regex over every line once per function (O(functions*lines)
+        # quadratic blow-up on large vendored trees).  The pipeline dedups the
+        # repeated line reports by (category, file, line).
+        cache = getattr(self, "_file_matches", None)
+        if not cache or cache[0] != fn.path:
+            matches = [
+                (i + 1, line) for i, line in enumerate(source_lines)
+                if self._RE.search(line)
+            ]
+            self._file_matches = (fn.path, matches)
+        _, matches = self._file_matches
         out = []
-        for lineno, line in enumerate(source_lines, 1):
-            # only report lines inside this function's span
-            if not (fn.line <= lineno <= fn.end_line):
-                continue
-            if self._RE.search(line):
-                out.append(_build_vuln(
-                    self.category, fn.path, lineno,
-                    line.strip(), "crypto",
-                    f"Weak cryptographic primitive in '{fn.name}'",
-                    "Use SHA-256 / bcrypt / PBKDF2 and authenticated modes (e.g. GCM).",
-                    fn.name,
-                ))
+        for lineno, line in matches:
+            out.append(_build_vuln(
+                self.category, fn.path, lineno,
+                line.strip(), "crypto",
+                f"Weak / misconfigured cryptographic primitive on line {lineno}",
+                "Use SHA-256 / bcrypt / PBKDF2 and authenticated modes (e.g. GCM) with per-message random IVs.",
+                fn.name or "<module>",
+            ))
         return out
 
 
@@ -1989,6 +2077,11 @@ class SecurityMisconfigurationDetector(StructuredDetector):
     _DJANGO_DEBUG_RE = re.compile(r"^DEBUG\s*=\s*True\b")
     _ALLOWED_HOSTS_RE = re.compile(
         r"^ALLOWED_HOSTS\s*=\s*\[\s*['\"]\*['\"]\s*\]")
+    # v0.7.0 – Tornado: ``settings = {"debug": True}`` and
+    # ``http_server.bind(7777, address='0.0.0.0')``.
+    _TORNADO_DEBUG_RE = re.compile(r"['\"]debug['\"]\s*:\s*True", re.I)
+    _TORNADO_BIND_RE = re.compile(
+        r"\.bind\s*\([^)]*address\s*=\s*['\"]0\.0\.0\.0['\"]", re.I)
 
     @staticmethod
     def _in_any_function(lineno: int, fn, project_ir) -> bool:
@@ -2011,13 +2104,17 @@ class SecurityMisconfigurationDetector(StructuredDetector):
             dbg = bool(self._DEBUG_RE.search(line))
             bind = bool(self._BIND_RE.search(line))
             cfg_dbg = bool(self._APP_CONFIG_DEBUG_RE.search(line))
+            # v0.7.0 – Tornado settings dict + insecure bind
+            tornado_dbg = bool(self._TORNADO_DEBUG_RE.search(line))
+            tornado_bind = bool(self._TORNADO_BIND_RE.search(line))
             # Bare ``DEBUG = True`` only counts at module level — never a
             # function-local variable.
             django_dbg = bool(self._DJANGO_DEBUG_RE.search(stripped)) and \
                 not self._in_any_function(lineno, fn, project_ir)
             hosts = bool(self._ALLOWED_HOSTS_RE.search(stripped))
 
-            if not (dbg or bind or cfg_dbg or django_dbg or hosts):
+            if not (dbg or bind or cfg_dbg or django_dbg or hosts
+                    or tornado_dbg or tornado_bind):
                 continue
 
             issues = []
@@ -2027,6 +2124,10 @@ class SecurityMisconfigurationDetector(StructuredDetector):
                 issues.append("host='0.0.0.0' (bound on all interfaces)")
             if cfg_dbg:
                 issues.append("app.config['DEBUG'] = True (debug mode enabled in production)")
+            if tornado_dbg:
+                issues.append("Tornado settings {'debug': True} (debug mode exposed)")
+            if tornado_bind:
+                issues.append("http_server.bind(address='0.0.0.0') (bound on all interfaces)")
             if django_dbg:
                 issues.append("module-level DEBUG = True (framework debug mode exposed)")
             if hosts:
@@ -3404,8 +3505,18 @@ class MissingAuthenticationDetector(StructuredDetector):
     # User input / state change indicators (only flag handlers that matter).
     _INPUT = re.compile(
         r"request\.(?:args|form|json|values|data|body|files|query_params|"
-        r"cookies|headers|POST|GET)\b|request\s*\[|Depends\s*\(",
+        r"cookies|headers|POST|GET)\b|request\s*\[|Depends\s*\("
+        # v0.7.0 – Bottle / Tornado request sources
+        r"|request\.(?:query|forms|params|environ)\.get\s*\("
+        r"|self\.get_argument\s*\("
+        r"|self\.request\.(?:files|body|arguments)\b",
         re.I,
+    )
+    # v0.7.0 – Tornado class handlers register routes in a table (no decorator
+    # path string), so decorator-based public-path exclusion misses them.
+    # Skip handlers whose *class* name is itself an auth / login endpoint.
+    _AUTH_HANDLER_NAME = re.compile(
+        r"login|signin|register|signup|logout|authenticat|auth|token", re.I,
     )
     # object-identifier parameter (``task_id`` / ``user_id`` / ``doc_id`` …)
     _ID_PARAM = re.compile(r"(?:^|_)(?:user|doc|order|account|file|task|item|record|obj|id|pk|uuid|invoice|transaction)_?(?:id)?$|_id$", re.I)
@@ -3430,16 +3541,22 @@ class MissingAuthenticationDetector(StructuredDetector):
         route_path = path_match.group(1) if path_match else ""
         if self._PUBLIC.search(route_path):
             return []
+        # v0.7.0: Tornado class-based handlers have no decorator path string;
+        # skip auth/login handler classes (e.g. ``UsersHandler`` / ``LoginHandler``).
+        if self._AUTH_HANDLER_NAME.search(getattr(fn, "class_name", "") or ""):
+            return []
         # Conservative sensitivity gate: only flag endpoints that touch a
         # specific resource by identifier (path/query object id, e.g.
         # ``task_id`` / ``user_id``) or that perform a direct database write.
         # Trivial demo / read-only handlers that merely echo request input
         # (``/query``, ``/upload``, ``/deserialize`` in a local lab) are not
         # reported — the benchmark's remediated reference must stay clean.
-        has_input = bool(fn.sources) or bool(fn.parameters) or bool(self._INPUT.search(body))
+        # v0.7.0: ``self``/``cls`` are method receivers, not user parameters.
+        real_params = [p for p in fn.parameters if p not in ("self", "cls")]
+        has_input = bool(fn.sources) or bool(real_params) or bool(self._INPUT.search(body))
         has_write = bool(self._WRITE.search(body))
         has_id_param = any(
-            re.search(self._ID_PARAM, p) for p in fn.parameters
+            re.search(self._ID_PARAM, p) for p in real_params
         )
         has_id_in_path = bool(re.search(r"\{\s*[\w_]*id[\w_]*\s*\}|<\w*:?\w*id\w*>", route_path, re.I))
         if not has_input:
@@ -3449,9 +3566,14 @@ class MissingAuthenticationDetector(StructuredDetector):
         # a direct DB write.  Local-lab demo handlers with NO parameters and
         # only in-body ``request.args/form`` echoes (the benchmark's remediated
         # reference) stay unreported.
-        if not (has_write or has_id_param or has_id_in_path or bool(fn.parameters)):
+        if not (has_write or has_id_param or has_id_in_path or bool(real_params)):
             return []
-        snippet = decos[0] if decos else f"@app.route(...) def {fn.name}"
+        if decos:
+            snippet = decos[0]
+        elif getattr(fn, "class_name", ""):
+            snippet = f"class {fn.class_name}: def {fn.name}(self)"
+        else:
+            snippet = f"def {fn.name}(...)"
         return [_build_vuln(
             self.category, fn.path, fn.line,
             snippet.strip()[:120], "auth",

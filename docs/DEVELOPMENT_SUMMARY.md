@@ -849,3 +849,65 @@ result = result.filter(text("title = '%s' or content = '%s'" % (filter, filter))
 - 新增 `tests/test_v060_fixes.py` 共 11 个用例：TOCTOU 报告 / 事务保护不报 / 非金融函数不报；无认证端点报告 / `Depends` 不报 / health 不报；SQL `?` 参数化不报、动态拼接仍报；SSRF 配置常量不报、请求 URL 仍报；`taint_names` 震荡回归不卡死。
 - 版本号 `0.5.2 → 0.6.0`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
 - 原 329 个测试全部通过；新增 11 个，总计 340 个测试通过。
+
+## 22. v0.7.0 第十四轮 — Tornado/Bottle 框架支持 + 漏洞链增强 + 加密深度检测
+
+### 22.0 概述
+
+第十四个攻坚轮面向三个新克隆靶场（`tornado-target` = mazzz3r/Vulnerable_Tornado_App，**Python 2 语法**；`bottle-target` = digiator42/Vulnerable-Bottle-App；`nexus-target/backend` = imanrojab/nexus-lab 多租户 FastAPI）以及 OWASP A02 加密靶场。核心痛点是 tornado-target 因 `print "..."` 语句触发 `SyntaxError`，**结构化检测器整体跳过**，只剩 legacy 正则产出 3 个发现。本轮新增 Python 2 内存预处理、Tornado/Bottle 两类框架源与 sink、7 条漏洞链规则、加密深度检测，版本 `0.6.0 → 0.7.0`。
+
+### 22.1 Python 2 兼容性（最高优先级）
+
+**根因**：`tornado-target/server.py` 含 `print "GET ", self.request.uri` 等 Python 2 print 语句，`ast.parse` 抛 `SyntaxError`，`extract_python` 返回空 `ProjectIR`，所有结构化检测器空转。
+
+**修复**（`ir.py`）：
+- 新增 `_py2_print_to_call(text)`：逐行正则 `^([ \t]*)print[ \t]+(?!\()(.*?)\s*$`，把 `print "..."` / `print expr` 转成 `print(...)`。注释行（`#print ...`）、已是函数调用的 `print(x)` / `print (x)` 均不动。
+- `extract_python` 改为**先按原文 `ast.parse`，仅在 `SyntaxError` 时内存转换重试**：对纯 Python 3 文件零开销、零行为变化；转换保留行数（一行进一行出），检测器行号与原文件对齐；**不落盘**，原始文件不被修改。
+- 转换后 tornado-target 12 个函数全部进入 IR（此前 0 个）。
+
+### 22.2 Tornado 框架支持
+
+Tornado 路由是 `class XHandler(tornado.web.RequestHandler)` 的 `get(self)`/`post(self)` 方法，而非 `@app.route` 装饰函数：
+- **IR**：`visit_ClassDef` 识别基类含 `RequestHandler` 的类，把其 `get/post/put/delete/...` 方法在 `FunctionIR.route_kind="tornado"` 标记；`is_route_handler()` 据此（而非仅装饰器）判定为路由处理器。
+- **源**：`self.get_argument(...)`、`self.request.files/body/arguments` 加入 `PY_SOURCE_PATTERNS` 与各检测器的污点源正则。
+- **XSS**：`self.render("tpl", var=user_input)` 中 kwarg 值来自污点源时报告（`self.render(..., query=query)`）；DB 输出经安全源排除不误报。
+- **文件上传**：`self.request.files['..']` + `io.open(path,'wb')` 写盘即报（无 Flask `.save()` 辅助）。
+- **配置**：`settings={"debug": True}` 字典字面量与 `http_server.bind(addr='0.0.0.0')` 纳入 `SecurityMisconfigurationDetector`。
+- **缺少认证**：Tornado 处理器无 `self.current_user`/`@tornado.web.authenticated` 时报告；`self`/`cls` 不计为用户参数，登录/`Users` 处理器类名自动排除。
+
+### 22.3 Bottle 框架支持
+
+- **源**：`request.query/forms/params/environ.get(...)` 加入源模式。
+- **SSTI**：`template(var)` 中 `var` 是动态变量（非静态模板名字面量、非函数参数）时报告；`template('login.html', ...)` 这类静态模板名不报。
+- 命中 bottle-target `config/api.py:help()`：用户控制的 markdown 经 `template(temp)` 作为模板源渲染。
+
+### 22.4 漏洞链分析器增强（7 条新链）
+
+在 `chain_analyzer.py` 既有 7 条规则上增量追加（仅加规则，不改匹配逻辑）：
+- `ssrf-to-internal-rce`（SSRF + 命令/代码执行 → Critical）
+- `upload-webshell`（上传 + 路径穿越 + 可执行写入 → Critical）
+- `deserial-to-privesc`（反序列化 + 代码执行 + 权限提升 → Critical）
+- `sqli-data-authbypass`（SQLi + 敏感数据 + 认证绕过 → High）
+- `xss-cookie-theft`（XSS + 不安全 Cookie → High）
+- `redirect-oauth-theft`（开放重定向 + JWT/硬编码密钥/OAuth 缺陷 → High）
+- `cmdi-lateral-move`（命令注入 + SSRF + 敏感数据 → High）
+
+### 22.5 加密漏洞深度检测
+
+`WeakCryptoDetector` 在 md5/sha1/ECB 基础上扩展：弱分组算法（DES/3DES/RC4/Blowfish，`Crypto.Cipher.*` 与 `cryptography.hazmat` 两种导入风格）、硬编码 IV（`iv=b'...'` 与 `AES_IV = b'...'` 常量）、`ssl.CERT_NONE` / `ssl._create_unverified_context()`。改为整文件扫描以覆盖模块级常量，并按文件缓存匹配行避免 O(函数数×行数) 二次开销。
+
+### 22.6 靶场复验
+
+- **tornado-target**：server.py 从 3 个发现提升到 10 个（新增 XSS×2、文件上传、debug、insecure-bind、missing-authentication）。
+- **bottle-target**：22 → 23（新增 1 个真实 SSTI，无下降）。
+- **nexus-target/backend**：53 发现不下降；漏洞链关联出 116 条组合链（含新规则 ssrf-to-internal-rce / deserial-to-privesc / redirect-oauth-theft / cmdi-lateral-move）。
+- **crypto-target**：13 → 14（新增硬编码 IV，ECB/md5 保留）。
+- **sast-target**：52 发现（≥48 不下降）。
+- **safe_app**：0 误报保持。
+
+### 22.7 测试与版本
+
+- 新增 `tests/fixtures/v070/`（`tornado_features.py` / `bottle_features.py` / `crypto_features.py`）。
+- 新增 `tests/test_v070_fixes.py` 共 17 个用例：Python 2 print 结构化解析且不落盘；Tornado 处理器识别 / `self.render` XSS / `request.files` 上传 / debug+bind 配置；Bottle `template(var)` SSTI 报告、静态模板名不报、request 源识别；加密 DES/ECB/硬编码 IV/TLS 验证关闭；7 条新链规则关联。
+- 版本号 `0.6.0 → 0.7.0`（`pyproject.toml`、`vulnresearch/__init__.py`、`models.py` SARIF tool version）。
+- 原 340 个测试全部通过；新增 17 个，总计 357 个测试通过。

@@ -101,6 +101,53 @@ _CHAIN_RULES: List[_ChainRule] = [
         severity="Medium",
         description="开放重定向 + XSS = 钓鱼链",
     ),
+    # v0.7.0 – deepened vulnerability-chain coverage
+    _ChainRule(
+        name="ssrf-to-internal-rce",
+        slots=[{"ssrf"}, {"command-injection", "code-injection"}],
+        severity="Critical",
+        description="SSRF + 内部命令/代码执行 = 内网RCE链",
+    ),
+    _ChainRule(
+        name="upload-webshell",
+        slots=[{"file-upload", "unrestricted-file-upload"},
+               {"path-traversal", "arbitrary-file-write"},
+               {"code-injection", "arbitrary-file-write"}],
+        severity="Critical",
+        description="文件上传 + 路径穿越 + 可执行写入 = Webshell链",
+    ),
+    _ChainRule(
+        name="deserial-to-privesc",
+        slots=[{"insecure-deserialization", "deserialization"},
+               {"code-injection"},
+               {"privilege-escalation"}],
+        severity="Critical",
+        description="反序列化 + 任意代码执行 + 权限提升链",
+    ),
+    _ChainRule(
+        name="sqli-data-authbypass",
+        slots=[{"sql-injection"}, {"sensitive-data-exposure"}, {"auth-bypass"}],
+        severity="High",
+        description="SQL注入 + 数据泄露 + 认证绕过链",
+    ),
+    _ChainRule(
+        name="xss-cookie-theft",
+        slots=[{"xss"}, {"insecure-cookie", "session-fixation", "weak-session"}],
+        severity="High",
+        description="XSS + 缺失HttpOnly/不安全Cookie = 会话劫持链",
+    ),
+    _ChainRule(
+        name="redirect-oauth-theft",
+        slots=[{"open-redirect"}, {"jwt-flaws", "hardcoded-secret", "oauth-flaws"}],
+        severity="High",
+        description="开放重定向 + OAuth/JWT缺陷 = 令牌窃取链",
+    ),
+    _ChainRule(
+        name="cmdi-lateral-move",
+        slots=[{"command-injection"}, {"ssrf"}, {"sensitive-data-exposure"}],
+        severity="High",
+        description="命令注入 + SSRF + 敏感数据 = 横向移动/数据窃取链",
+    ),
 ]
 
 
