@@ -1,4 +1,4 @@
-"""Tests for the PHASE 2 intra-procedural data-flow analysis."""
+"""Tests for the intra-procedural data-flow analysis."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,6 +10,7 @@ from vulnresearch.dataflow import (
     Definition,
     Use,
     is_tainted,
+    is_tainted_at,
 )
 
 
@@ -31,10 +32,8 @@ def test_definitions_and_use_chains(tmp_path: Path):
     var_names = {d.var_name for d in result.definitions}
     assert "x" in var_names
     assert "y" in var_names
-    # x flows into the process() call
     x_uses = result.def_use_chains.get("x", [])
     assert any(u.context == "call:process" for u in x_uses)
-    # y flows into the output() call
     y_uses = result.def_use_chains.get("y", [])
     assert any(u.context == "call:output" for u in y_uses)
 
@@ -57,8 +56,19 @@ def test_tainted_variable_from_source(tmp_path: Path):
         "    output(y)\n",
     )
     assert is_tainted("x", result, []) is True
-    # y is derived from a call, not directly from a source token
-    assert is_tainted("y", result, []) is False
+    # Taint now propagates through ordinary variable dependencies.
+    assert is_tainted("y", result, []) is True
+
+
+def test_transitive_taint_through_multiple_assignments(tmp_path: Path):
+    result = _analyze(tmp_path,
+        "def f():\n"
+        "    raw = request.args.get('id')\n"
+        "    first = raw\n"
+        "    second = first\n"
+        "    output(second)\n",
+    )
+    assert is_tainted("second", result, []) is True
 
 
 def test_redefinition_takes_latest_definition(tmp_path: Path):
@@ -68,11 +78,33 @@ def test_redefinition_takes_latest_definition(tmp_path: Path):
         "    x = \"safe\"\n"
         "    output(x)\n",
     )
-    # the latest assignment overwrites taint
     assert is_tainted("x", result, []) is False
     x_defs = [d for d in result.definitions if d.var_name == "x"]
     assert len(x_defs) == 2
     assert max(d.line for d in x_defs) == 3
+
+
+def test_taint_at_point_respects_redefinition(tmp_path: Path):
+    result = _analyze(tmp_path,
+        "def f():\n"
+        "    x = request.args.get('id')\n"
+        "    before = x\n"
+        "    x = \"safe\"\n"
+        "    after = x\n"
+    )
+    assert is_tainted_at("x", result, 3) is True
+    assert is_tainted_at("before", result, 3) is True
+    assert is_tainted_at("x", result, 5) is False
+    assert is_tainted_at("after", result, 5) is False
+
+
+def test_source_text_inside_string_is_not_source(tmp_path: Path):
+    result = _analyze(tmp_path,
+        "def f():\n"
+        "    x = \"request.args.get\"\n"
+        "    output(x)\n",
+    )
+    assert is_tainted("x", result, []) is False
 
 
 def test_use_in_return_value(tmp_path: Path):
