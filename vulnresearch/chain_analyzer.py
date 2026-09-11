@@ -60,8 +60,6 @@ class ChainAnalyzer:
     def find_chains(self, vulns: List[Vulnerability], callgraph: CallGraph) -> List[VulnerabilityChain]:
         by_category: Dict[str, List[Vulnerability]] = defaultdict(list)
         for v in vulns:
-            # A chain is a claim about a vulnerability, not merely a pattern.
-            # E0/E1 findings are insufficient to support composition.
             if _EVIDENCE_RANK.get((v.evidence.level or "E0").upper(), 0) < 2:
                 continue
             if (v.status or "").lower() in {"potential", "false-positive", "rejected"}:
@@ -70,7 +68,6 @@ class ChainAnalyzer:
 
         chains: List[VulnerabilityChain] = []
         seen_combos: Set[tuple] = set()
-
         for idx, rule in enumerate(_CHAIN_RULES, start=1):
             for combo in self._pick(by_category, rule.slots):
                 combo_key = tuple(id(v) for v in combo)
@@ -119,15 +116,17 @@ class ChainAnalyzer:
     def _has_program_relationship(combo: Sequence[Vulnerability], callgraph: CallGraph) -> bool:
         """Require a plausible static relationship between every adjacent step.
 
-        Same-file findings are accepted because they may share a function whose
-        name was not retained by an older detector.  Otherwise, known function
-        nodes must be connected by a directed call path in either direction.
-        Unknown locations are deliberately rejected rather than upgraded by
-        category coincidence alone.
+        A same-file match is only accepted when both findings point to the same
+        function, or when an older detector omitted function metadata on one
+        side. Two different known functions in the same file are not enough:
+        they must be connected by the call graph.
         """
         for left, right in zip(combo, combo[1:]):
             if left.file and right.file and left.file == right.file:
-                continue
+                lf = (left.function or "").strip()
+                rf = (right.function or "").strip()
+                if not lf or not rf or lf == rf:
+                    continue
             lf = (left.function or "").strip()
             rf = (right.function or "").strip()
             if not lf or not rf:
@@ -137,12 +136,27 @@ class ChainAnalyzer:
         return True
 
     @staticmethod
+    def _unique_nodes(callgraph: CallGraph, name: str) -> Set[str]:
+        """Resolve a function name only when it maps unambiguously."""
+        if not name:
+            return set()
+        exact = {name} if name in callgraph.nodes else set()
+        if exact:
+            return exact
+        matches = {
+            q for q in callgraph.nodes
+            if q.endswith("." + name) or q.split(".")[-1] == name
+        }
+        return matches if len(matches) == 1 else set()
+
+    @staticmethod
     def _connected(callgraph: CallGraph, left: str, right: str) -> bool:
-        def reachable(start: str, target: str) -> bool:
-            starts = [q for q in callgraph.nodes if q == start or q.endswith("." + start) or q.split(".")[-1] == start]
-            targets = {q for q in callgraph.nodes if q == target or q.endswith("." + target) or q.split(".")[-1] == target}
-            if not starts or not targets:
-                return False
+        left_nodes = ChainAnalyzer._unique_nodes(callgraph, left)
+        right_nodes = ChainAnalyzer._unique_nodes(callgraph, right)
+        if not left_nodes or not right_nodes:
+            return False
+
+        def reachable(starts: Set[str], targets: Set[str]) -> bool:
             seen: Set[str] = set(starts)
             stack = list(starts)
             while stack:
@@ -155,4 +169,4 @@ class ChainAnalyzer:
                         stack.append(nxt)
             return False
 
-        return reachable(left, right) or reachable(right, left)
+        return reachable(left_nodes, right_nodes) or reachable(right_nodes, left_nodes)
