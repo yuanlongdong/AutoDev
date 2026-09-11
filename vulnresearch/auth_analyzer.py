@@ -1,97 +1,49 @@
 """Authentication & authorisation deep analysis (PHASE 6).
 
-For each externally reachable asset the analyzer reconstructs the
-authentication / authorisation chain and flags common weaknesses:
-
-* **missing_authz** – authenticated but never authorisation-checked
-* **idor** – caller-supplied object id used in a query without ownership check
-* **auth_bypass** – internal / admin API exposed without authentication
-* **priv_esc** – privilege boundary crossed without a role check
-* **tenant_break** – no tenant filter on a data access
-* **frontend_authz** – authorisation decision driven by client input
-* **hidden_endpoint** – handler-shaped function with no route registration
-* **method_diff** – inconsistent auth across HTTP methods on the same path
-
-The analyzer models the four canonical abuse scenarios:
-User A→Object A (normal), User A→Object B (IDOR),
-Normal user→Admin function (priv-esc), Tenant A→Tenant B (tenant break).
-
-Pure Python standard library; no execution, no network.
+Checks are scoped to the vulnerable function and, for data-access findings,
+to checks that occur before the relevant query. This prevents an unrelated or
+late authorization call from being treated as protection for the sink.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from typing import Dict, List
 
 from .ir import FunctionIR, ProjectIR
 from .knowledge_base import AUTH_PATTERNS
 from .asset_analyzer import AttackSurface, CodeAsset
 
-
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
+_ID_PARAM_RE = re.compile(r"^(?:user_id|order_id|account_id|doc_id|file_id|id|pk|uuid)$", re.IGNORECASE)
+_QUERY_CALL_RE = re.compile(r"\b(execute|raw|query|filter|find_one|find\b|get_or_404|get\b|first\b)\s*\(", re.IGNORECASE)
+_CLIENT_CONTROLLED_AUTHZ_RE = re.compile(r"(?:request\.args|request\.form|request\.json|request\.cookies)[^\n]*(?:admin|role|is_staff|superuser|permission)", re.IGNORECASE)
+_ROUTE_DECORATOR_RE = re.compile(r"@[\w\.]*\s*(?:route|get|post|put|delete|patch)\s*\(", re.IGNORECASE)
+_ROLE_TOKENS = ("roles_required", "user_has_role", "require_admin", "is_admin", "is_superuser")
+_PERMISSION_TOKENS = ("permission_required", "has_permission", "has_access")
+_OWNERSHIP_TOKENS = ("check_owner", "is_owner", "assert_owner", "belongs_to", "check_permission", "owner_id")
+_TENANT_TOKENS = ("check_tenant", "tenant_filter", "assert_tenant", "tenant_id")
+_IDENTITY_TOKENS = ("get_current_user", "current_user", "login_user", "session[")
 
 
 @dataclass
 class AuthChain:
-    """Reconstructed authentication / authorisation chain for one function."""
-
-    authentication: str = "unknown"      # present / missing / unknown
-    identity: str = "unknown"           # present / missing
-    role: str = "unknown"               # present / missing
-    permission: str = "unknown"         # present / missing
-    object_ownership: str = "unknown"   # present / missing
-    tenant: str = "unknown"             # present / missing
-    action: str = "unknown"             # e.g. "get_order"
+    authentication: str = "unknown"
+    identity: str = "unknown"
+    role: str = "unknown"
+    permission: str = "unknown"
+    object_ownership: str = "unknown"
+    tenant: str = "unknown"
+    action: str = "unknown"
 
 
 @dataclass
 class AuthFinding:
-    """A discovered authentication / authorisation weakness."""
-
-    type: str           # auth_bypass / idor / priv_esc / tenant_break /
-                        # missing_authz / frontend_authz / predictable_id /
-                        # hidden_endpoint / method_diff
+    type: str
     description: str
     file: str
     line: int
     function: str
     severity: str
-
-
-# ---------------------------------------------------------------------------
-# Regex helpers
-# ---------------------------------------------------------------------------
-
-# Parameter names that look like direct object references
-_ID_PARAM_RE = re.compile(r"^(?:user_id|order_id|account_id|doc_id|file_id|id|pk|uuid)$", re.IGNORECASE)
-# Calls that perform an ownership / tenant check
-_OWNERSHIP_FNS = {
-    "check_owner", "is_owner", "verify_owner", "assert_owner",
-    "belongs_to", "check_permission",
-}
-_TENANT_FNS = {"check_tenant", "tenant_filter", "assert_tenant", "ensure_tenant"}
-_AUTHZ_FNS = set(AUTH_PATTERNS["authorization_functions"]) | set(AUTH_PATTERNS["authorization_decorators"])
-_AUTHN_FNS = set(AUTH_PATTERNS["authentication_functions"]) | set(AUTH_PATTERNS["authentication_decorators"])
-_QUERY_CALL_RE = re.compile(
-    r"\b(execute|raw|query|filter|find_one|find\b|get_or_404|get\b|first\b)\s*\(",
-    re.IGNORECASE,
-)
-_CLIENT_CONTROLLED_AUTHZ_RE = re.compile(
-    r"(?:request\.args|request\.form|request\.json|request\.cookies)"
-    r"[^\n]*(?:admin|role|is_staff|superuser|permission)",
-    re.IGNORECASE,
-)
-_ROUTE_DECORATOR_RE = re.compile(
-    r"@[\w\.]*\s*(?:route|get|post|put|delete|patch)\s*\(", re.IGNORECASE
-)
-
-
-# ---------------------------------------------------------------------------
-# Auth analyzer
-# ---------------------------------------------------------------------------
 
 
 class AuthAnalyzer:
@@ -100,150 +52,67 @@ class AuthAnalyzer:
     def __init__(self) -> None:
         self._file_cache: Dict[str, List[str]] = {}
 
-    # -- public API --------------------------------------------------------
-
-    def analyze(
-        self,
-        project_ir: ProjectIR,
-        attack_surface: AttackSurface,
-    ) -> List[AuthFinding]:
-        """Analyse every reachable asset and return a list of findings."""
+    def analyze(self, project_ir: ProjectIR, attack_surface: AttackSurface) -> List[AuthFinding]:
         findings: List[AuthFinding] = []
-
-        # index functions by (name, file) so assets can resolve them
-        fn_index: Dict[tuple, FunctionIR] = {}
-        for fn in project_ir.functions:
-            fn_index[(fn.name, fn.path)] = fn
-
+        fn_index: Dict[tuple, FunctionIR] = {(fn.name, fn.path): fn for fn in project_ir.functions}
         for asset in attack_surface.assets:
             if asset.type not in ("http_handler", "admin_api", "internal_api"):
                 continue
             fn = fn_index.get((asset.name, asset.file))
             if fn is None:
                 continue
-
-            chain = self.build_auth_chain(fn)
-            findings.extend(self._check_asset(asset, fn, chain))
-
-        # hidden-endpoint scan: handler-shaped functions with no route decorator
+            findings.extend(self._check_asset(asset, fn, self.build_auth_chain(fn)))
         findings.extend(self._find_hidden_endpoints(project_ir))
         return findings
 
-    # -- chain reconstruction ----------------------------------------------
-
     def build_auth_chain(self, fn: FunctionIR) -> AuthChain:
-        """Reconstruct the auth chain for a single function."""
         lines = self._read_lines(fn.path)
         decorators = self._extract_decorators(lines, fn.line)
         body = self._body_slice(fn, lines)
         body_text = "\n".join(body)
         body_l = body_text.lower()
-        calls_l = " ".join(c.name for c in fn.calls)
-
-        chain = AuthChain(action=fn.name)
-
-        # authentication
-        authn_present = any(
-            deco.split("(")[0].strip() in AUTH_PATTERNS["authentication_decorators"]
-            for deco in decorators
-        ) or any(fn_name in body_text for fn_name in AUTH_PATTERNS["authentication_functions"])
-        chain.authentication = "present" if authn_present else "missing"
-
-        # identity resolution
-        chain.identity = "present" if any(
-            tok in body_text for tok in ("get_current_user", "current_user", "login_user", "session[")
-        ) else "missing"
-
-        # role
-        chain.role = "present" if any(
-            tok in body_l for tok in ("roles_required", "user_has_role", "require_admin", "is_admin", "is_superuser")
-        ) else "missing"
-
-        # permission
-        chain.permission = "present" if any(
-            tok in body_l for tok in ("permission_required", "has_permission", "has_access")
-        ) else "missing"
-
-        # object ownership
-        chain.object_ownership = "present" if any(
-            tok in body_l for tok in ("check_owner", "is_owner", "assert_owner", "belongs_to", "owner_id")
-        ) else "missing"
-
-        # tenant
-        chain.tenant = "present" if any(
-            tok in body_l for tok in ("check_tenant", "tenant_filter", "assert_tenant", "tenant_id")
-        ) else "missing"
-
-        return chain
-
-    # -- per-asset checks ---------------------------------------------------
+        return AuthChain(
+            authentication="present" if any(deco.split("(")[0].strip() in AUTH_PATTERNS["authentication_decorators"] for deco in decorators) or any(x in body_text for x in AUTH_PATTERNS["authentication_functions"]) else "missing",
+            identity="present" if any(x in body_text for x in _IDENTITY_TOKENS) else "missing",
+            role="present" if any(x in body_l for x in _ROLE_TOKENS) else "missing",
+            permission="present" if any(x in body_l for x in _PERMISSION_TOKENS) else "missing",
+            object_ownership="present" if any(x in body_l for x in _OWNERSHIP_TOKENS) else "missing",
+            tenant="present" if any(x in body_l for x in _TENANT_TOKENS) else "missing",
+            action=fn.name,
+        )
 
     def _check_asset(self, asset: CodeAsset, fn: FunctionIR, chain: AuthChain) -> List[AuthFinding]:
         out: List[AuthFinding] = []
-        body_text = "\n".join(self._body_slice(fn, self._read_lines(fn.path)))
+        lines = self._body_slice(fn, self._read_lines(fn.path))
+        body_text = "\n".join(lines)
         body_l = body_text.lower()
+        query_line = self._first_matching_line(lines, _QUERY_CALL_RE)
+        pre_query = lines if query_line is None else lines[:query_line + 1]
+        pre_query_text = "\n".join(pre_query).lower()
 
-        # 1. internal API / admin API with no authentication at all
         if asset.type in ("internal_api", "admin_api") and asset.auth_required != "required":
-            out.append(AuthFinding(
-                type="auth_bypass",
-                description=f"{asset.type} '{asset.name}' is reachable without any authentication decorator",
-                file=fn.path, line=fn.line, function=fn.name, severity="High",
-            ))
+            out.append(AuthFinding("auth_bypass", f"{asset.type} '{asset.name}' is reachable without any authentication decorator", fn.path, fn.line, fn.name, "High"))
 
-        # 2. authenticated but no authorisation (只认证不授权)
-        if chain.authentication == "present" and chain.permission == "missing" and chain.role == "missing":
-            # only flag for user-facing resources, not purely public endpoints
-            if chain.identity == "present" or asset.type == "http_handler":
-                out.append(AuthFinding(
-                    type="missing_authz",
-                    description=f"'{fn.name}' authenticates the caller but performs no "
-                                "authorisation / permission / role check",
-                    file=fn.path, line=fn.line, function=fn.name, severity="Medium",
-                ))
+        role_before = any(x in pre_query_text for x in _ROLE_TOKENS)
+        permission_before = any(x in pre_query_text for x in _PERMISSION_TOKENS)
+        if chain.authentication == "present" and not role_before and not permission_before and (chain.identity == "present" or asset.type == "http_handler"):
+            out.append(AuthFinding("missing_authz", f"'{fn.name}' authenticates the caller but no role/permission check is proven before the data-access path", fn.path, fn.line, fn.name, "Medium"))
 
-        # 3. IDOR – caller-supplied id used in a query without ownership check
         id_params = [p for p in fn.parameters if _ID_PARAM_RE.match(p)]
-        if id_params and _QUERY_CALL_RE.search(body_text) and chain.object_ownership == "missing":
-            out.append(AuthFinding(
-                type="idor",
-                description=f"'{fn.name}' uses caller-supplied id parameter(s) "
-                            f"{id_params} in a query with no ownership check",
-                file=fn.path, line=fn.line, function=fn.name, severity="High",
-            ))
+        ownership_before = any(x in pre_query_text for x in _OWNERSHIP_TOKENS)
+        if id_params and query_line is not None and not ownership_before:
+            out.append(AuthFinding("idor", f"'{fn.name}' uses caller-supplied id parameter(s) {id_params} in a query with no ownership check proven before the query", fn.path, fn.line, fn.name, "High"))
 
-        # 4. frontend-driven authorisation (client-controlled decision)
         if _CLIENT_CONTROLLED_AUTHZ_RE.search(body_text):
-            out.append(AuthFinding(
-                type="frontend_authz",
-                description=f"'{fn.name}' makes an authorisation decision based on "
-                            "client-supplied request parameters",
-                file=fn.path, line=fn.line, function=fn.name, severity="Medium",
-            ))
+            out.append(AuthFinding("frontend_authz", f"'{fn.name}' makes an authorisation decision based on client-supplied request parameters", fn.path, fn.line, fn.name, "Medium"))
 
-        # 5. privilege escalation surface: admin-ish endpoint without role check
-        if asset.type == "admin_api" and chain.role == "missing":
-            out.append(AuthFinding(
-                type="priv_esc",
-                description=f"admin asset '{fn.name}' exposes privileged functionality "
-                            "without a role / admin check",
-                file=fn.path, line=fn.line, function=fn.name, severity="High",
-            ))
+        if asset.type == "admin_api" and not role_before:
+            out.append(AuthFinding("priv_esc", f"admin asset '{fn.name}' exposes privileged functionality without a role/admin check proven before the data-access path", fn.path, fn.line, fn.name, "High"))
 
-        # 6. tenant break: data access without tenant filter
-        if ("tenant" in body_l or "account" in body_l) and chain.tenant == "missing":
-            # only flag when the function touches a query (multi-tenant smell)
-            if _QUERY_CALL_RE.search(body_text):
-                out.append(AuthFinding(
-                    type="tenant_break",
-                    description=f"'{fn.name}' accesses tenant/account-scoped data "
-                                "without a tenant isolation filter",
-                    file=fn.path, line=fn.line, function=fn.name, severity="High",
-                ))
-
+        tenant_before = any(x in pre_query_text for x in _TENANT_TOKENS)
+        if ("tenant" in body_l or "account" in body_l) and query_line is not None and not tenant_before:
+            out.append(AuthFinding("tenant_break", f"'{fn.name}' accesses tenant/account-scoped data without a tenant isolation filter proven before the query", fn.path, fn.line, fn.name, "High"))
         return out
-
-    # -- hidden-endpoint scan ----------------------------------------------
 
     def _find_hidden_endpoints(self, project_ir: ProjectIR) -> List[AuthFinding]:
         out: List[AuthFinding] = []
@@ -251,18 +120,10 @@ class AuthAnalyzer:
             name_l = fn.name.lower()
             if not any(k in name_l for k in ("handler", "view", "endpoint")):
                 continue
-            lines = self._read_lines(fn.path)
-            decorators = self._extract_decorators(lines, fn.line)
+            decorators = self._extract_decorators(self._read_lines(fn.path), fn.line)
             if not any(_ROUTE_DECORATOR_RE.search(d) for d in decorators):
-                out.append(AuthFinding(
-                    type="hidden_endpoint",
-                    description=f"handler-shaped function '{fn.name}' has no route decorator; "
-                                "it may be reachable directly",
-                    file=fn.path, line=fn.line, function=fn.name, severity="Low",
-                ))
+                out.append(AuthFinding("hidden_endpoint", f"handler-shaped function '{fn.name}' has no route decorator; it may be reachable directly", fn.path, fn.line, fn.name, "Low"))
         return out
-
-    # -- source helpers ------------------------------------------------------
 
     def _read_lines(self, path: str) -> List[str]:
         if path not in self._file_cache:
@@ -290,6 +151,11 @@ class AuthAnalyzer:
 
     @staticmethod
     def _body_slice(fn: FunctionIR, lines: List[str]) -> List[str]:
-        start = max(0, fn.line - 1)
-        end = min(len(lines), fn.end_line)
-        return lines[start:end]
+        return lines[max(0, fn.line - 1):min(len(lines), fn.end_line)]
+
+    @staticmethod
+    def _first_matching_line(lines: List[str], pattern: re.Pattern[str]):
+        for idx, line in enumerate(lines):
+            if pattern.search(line):
+                return idx
+        return None
