@@ -1,10 +1,9 @@
 """Cross-function call-graph construction and reachability analysis.
 
-The call graph is built from the call sites already recorded on each
-:class:`~vulnresearch.ir.FunctionIR`.  Callees are matched by name (both
-fully-qualified and short names, so ``handle(x)`` and ``self.handle(x)``
-resolve to the same function).  Cycles are handled by visited-set tracking so
-path finding terminates.
+The graph is deliberately conservative: ambiguous short-name calls are not
+resolved unless the caller's class/module context provides a unique candidate.
+This prevents unrelated same-named functions from being connected merely by
+string coincidence.
 """
 from __future__ import annotations
 
@@ -23,7 +22,6 @@ class CallGraph:
     edges: Dict[str, List[str]] = field(default_factory=dict)
 
 
-# Decorator substrings that mark a function as a web entry point / route.
 _ROUTER_HINTS = {"route", "get", "post", "put", "delete", "patch", "handler", "on_request"}
 
 
@@ -42,7 +40,7 @@ class CallGraphBuilder:
             callees: List[str] = []
             seen: Set[str] = set()
             for cs in fn.calls:
-                target = self._resolve(cs.name, nodes, by_short_name)
+                target = self._resolve(cs.name, fn, nodes, by_short_name)
                 if target and target not in seen:
                     seen.add(target)
                     callees.append(target)
@@ -52,26 +50,38 @@ class CallGraphBuilder:
     @staticmethod
     def _resolve(
         call_name: str,
+        caller: FunctionIR,
         nodes: Dict[str, FunctionIR],
         by_short_name: Dict[str, List[str]],
-    ):
-        """Resolve a call site name to a qualified function name, or ``None``."""
+    ) -> str | None:
+        """Resolve a call conservatively, returning ``None`` when ambiguous."""
         if not call_name or call_name == "<dynamic>":
             return None
-        # exact qualified match
         if call_name in nodes:
             return call_name
-        # module.function / self.method -> match on the final identifier
+
         short = call_name.split(".")[-1]
-        if short in by_short_name:
-            candidates = by_short_name[short]
-            if len(candidates) == 1:
-                return candidates[0]
-            # prefer a candidate whose qualified name ends with the call name
-            for cand in candidates:
-                if cand == call_name or cand.endswith("." + short):
-                    return cand
+        candidates = by_short_name.get(short, [])
+        if not candidates:
+            return None
+        if len(candidates) == 1:
             return candidates[0]
+
+        # ``self.method()`` / ``cls.method()``: prefer the caller's class.
+        if call_name.startswith(("self.", "cls.")) and caller.class_name:
+            scoped = [c for c in candidates if c == f"{caller.class_name}.{short}"]
+            if len(scoped) == 1:
+                return scoped[0]
+
+        # A dotted module/function call can be matched against the qualified
+        # suffix only when that suffix identifies exactly one candidate.
+        suffix = "." + call_name
+        scoped = [c for c in candidates if c.endswith(suffix)]
+        if len(scoped) == 1:
+            return scoped[0]
+
+        # Do not guess. An unresolved edge is safer than a false program
+        # relationship in vulnerability-chain analysis.
         return None
 
 
@@ -79,10 +89,11 @@ def _resolve_node(graph: CallGraph, name: str) -> str:
     """Resolve an entry name (qualified or short) to a node key."""
     if name in graph.nodes:
         return name
-    for qname in graph.nodes:
-        if qname == name or qname.endswith("." + name) or qname.split(".")[-1] == name:
-            return qname
-    return name
+    matches = [
+        qname for qname in graph.nodes
+        if qname.endswith("." + name) or qname.split(".")[-1] == name
+    ]
+    return matches[0] if len(matches) == 1 else name
 
 
 def reachable_from(callgraph: CallGraph, entry_point: str) -> Set[str]:
@@ -106,11 +117,7 @@ def find_paths_to_sink(
     sink_name: str,
     max_depth: int = 10,
 ) -> List[List[str]]:
-    """Find all simple paths from any function to the function named ``sink_name``.
-
-    Cycles are cut with a per-path visited set; paths longer than ``max_depth``
-    are abandoned.  Returns call-ordered paths ``[caller, ..., sink]``.
-    """
+    """Find simple call paths from any function to ``sink_name``."""
     targets = {
         q for q in callgraph.nodes
         if q == sink_name or q.split(".")[-1] == sink_name
@@ -138,16 +145,14 @@ def find_paths_to_sink(
 
 
 def entry_points(callgraph: CallGraph) -> List[str]:
-    """Identify entry points: router-decorated functions or uncalled public functions."""
+    """Identify router-decorated or otherwise uncalled public functions."""
     called: Set[str] = set()
     for callees in callgraph.edges.values():
         called.update(callees)
 
     routers: List[str] = []
     for qname, fn in callgraph.nodes.items():
-        is_router = any(
-            any(hint in dec for hint in _ROUTER_HINTS) for dec in fn.decorators
-        )
+        is_router = any(any(hint in dec for hint in _ROUTER_HINTS) for dec in fn.decorators)
         is_uncalled_public = qname not in called and not fn.name.startswith("_")
         if is_router or is_uncalled_public:
             routers.append(qname)
