@@ -1,17 +1,16 @@
 """Intra-procedural data-flow analysis: definitions, uses and def-use chains.
 
-Definitions come from assignment statements (with line numbers and the
-right-hand side expression); uses come from call arguments and return values.
-The analyser rebuilds the function AST from the supplied source lines (it
-never imports or executes the target project).  ``is_tainted`` checks whether
-a variable's *most recent* definition derives from a source token.
+The analyser is deliberately static: it parses supplied source text and never
+imports, executes, or contacts the target project.  Taint is conservative and
+transitive within one function, while respecting the latest definition before
+the point being queried.
 """
 from __future__ import annotations
 
 import ast
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 from .ir import FunctionIR
 from .knowledge_base import SOURCE_TOKENS
@@ -81,7 +80,6 @@ class DataFlowAnalyzer:
                     for name in self._load_names(node.value):
                         uses.append(Use(name, node.lineno, context="return"))
 
-        # -- def-use chains: variable -> the places it is used ---------------
         chains: Dict[str, List[Use]] = {}
         for defn in definitions:
             chains.setdefault(defn.var_name, [])
@@ -91,10 +89,10 @@ class DataFlowAnalyzer:
 
         return DataFlowResult(definitions=definitions, uses=uses, def_use_chains=chains)
 
-    # -- helpers ----------------------------------------------------------
-
     @staticmethod
-    def _unparse(node: ast.AST) -> str:
+    def _unparse(node: Optional[ast.AST]) -> str:
+        if node is None:
+            return ""
         try:
             return ast.unparse(node)
         except Exception:
@@ -117,7 +115,6 @@ class DataFlowAnalyzer:
 
     @staticmethod
     def _load_names(node: ast.AST) -> List[str]:
-        """Collect ``Load``-context variable names referenced by an expression."""
         out: List[str] = []
         for child in ast.walk(node):
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
@@ -145,15 +142,103 @@ class DataFlowAnalyzer:
         return None
 
 
-def is_tainted(variable: str, result: DataFlowResult, source_lines: List[str]) -> bool:
-    """Return ``True`` if the variable's most recent definition comes from a source.
+def _normalise_source_tokens() -> Set[str]:
+    """Return source markers in a form suitable for AST path matching."""
+    return {token.rstrip("(") for token in SOURCE_TOKENS if token}
 
-    When a variable is assigned multiple times the definition with the largest
-    line number (the nearest one) is consulted.
-    """
-    defs = [d for d in result.definitions if d.var_name == variable]
-    if not defs:
+
+def _attribute_path(node: ast.AST) -> str:
+    """Return a dotted AST path for ``request.args.get``-like expressions."""
+    parts: List[str] = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def _contains_source_expression(expression: str) -> bool:
+    """Detect a source expression without matching arbitrary string literals."""
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except (SyntaxError, ValueError):
         return False
-    latest = max(defs, key=lambda d: d.line)
-    expr = latest.expression
-    return any(tok and tok in expr for tok in SOURCE_TOKENS)
+
+    tokens = _normalise_source_tokens()
+    for node in ast.walk(tree):
+        candidates: List[str] = []
+        if isinstance(node, ast.Call):
+            candidates.append(_attribute_path(node.func))
+            if isinstance(node.func, ast.Name):
+                candidates.append(node.func.id)
+        elif isinstance(node, ast.Attribute):
+            candidates.append(_attribute_path(node))
+        elif isinstance(node, ast.Name):
+            candidates.append(node.id)
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if any(candidate == token or candidate.startswith(token + ".") for token in tokens):
+                return True
+    return False
+
+
+def is_tainted_at(variable: str, result: DataFlowResult, line: int) -> bool:
+    """Return conservative taint status at ``line`` using transitive def-use data.
+
+    Only definitions at or before ``line`` participate.  If a definition is
+    derived from another variable, that dependency is followed recursively.
+    Cycles are treated as unknown/non-tainted rather than looping forever.
+    """
+    visiting: Set[str] = set()
+    cache: Dict[str, bool] = {}
+
+    def resolve(name: str, before_line: int) -> bool:
+        key = f"{name}@{before_line}"
+        if key in cache:
+            return cache[key]
+        if key in visiting:
+            return False
+        visiting.add(key)
+
+        candidates = [d for d in result.definitions if d.var_name == name and d.line <= before_line]
+        if not candidates:
+            visiting.discard(key)
+            cache[key] = False
+            return False
+        definition = max(candidates, key=lambda d: d.line)
+
+        tainted = _contains_source_expression(definition.expression)
+        if not tainted:
+            try:
+                expr_tree = ast.parse(definition.expression, mode="eval")
+            except (SyntaxError, ValueError):
+                expr_tree = None
+            if expr_tree is not None:
+                deps = {
+                    n.id for n in ast.walk(expr_tree)
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+                }
+                tainted = any(resolve(dep, definition.line - 1) for dep in deps if dep != name)
+
+        visiting.discard(key)
+        cache[key] = tainted
+        return tainted
+
+    return resolve(variable, line)
+
+
+def is_tainted(variable: str, result: DataFlowResult, source_lines: List[str]) -> bool:
+    """Return whether the latest definition of ``variable`` is transitively tainted.
+
+    ``source_lines`` is retained for backward compatibility with the original
+    API.  The analysis result already contains the parsed definition data.
+    """
+    del source_lines
+    if not any(d.var_name == variable for d in result.definitions):
+        return False
+    latest_line = max(d.line for d in result.definitions if d.var_name == variable)
+    return is_tainted_at(variable, result, latest_line)
